@@ -117,31 +117,81 @@ pub struct ChatRequest {
     pub include_usage: bool,
     pub enable_thinking: bool,
     pub parallel_tool_calls: bool,
+    /// Decoded images in prompt order (perf reset V2); each stands in a message as an image marker.
+    pub images: Vec<std::sync::Arc<crate::engine::ImageInput>>,
 }
 
 /// The model id this server serves (A8; the vendored tools send it).
 pub const MODEL_ID: &str = "mimo-v2.6-flash";
 
-const MEDIA_TYPES: &[&str] = &[
-    "image_url", "input_image", "image",
-    "input_audio", "audio",
-    "input_video", "video",
-];
+const IMAGE_TYPES: &[&str] = &["image_url", "input_image", "image"];
+const MEDIA_TYPES: &[&str] = &["input_audio", "audio", "input_video", "video"];
 
-fn flatten_content(content: &Json) -> Result<String, ApiError> {
+/// Images kept per request (perf reset V2; ADVISOR-I3 §10.2 item 6): the newest ones, the older
+/// ones replaced by a note, so a long conversation with many images keeps working.
+pub const MAX_IMAGES: usize = 16;
+
+/// Image state while a request's messages are parsed.
+struct Images {
+    seen: usize,
+    keep_from: usize,
+    out: Vec<std::sync::Arc<crate::engine::ImageInput>>,
+}
+
+/// Client text without the image-marker noncharacters (only the API places markers).
+fn clean(s: &str) -> String {
+    s.chars().filter(|&c| c != crate::engine::IMAGE_OPEN && c != crate::engine::IMAGE_CLOSE).collect()
+}
+
+/// The URL of an image part: `image_url: {url}` (Chat Completions), `image_url: "…"` (Responses
+/// `input_image`) or `image: "…"`.
+fn image_url(part: &Json) -> Option<&str> {
+    let v = part.get("image_url").or_else(|| part.get("image"))?;
+    v.as_str().or_else(|| v.get("url").and_then(|u| u.as_str()))
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
+fn decode_image(url: &str) -> Result<crate::engine::ImageInput, ApiError> {
+    if !url.starts_with("data:") {
+        return Err(ApiError::bad_request(
+            "image URLs are not fetched; send the image inline as a data URL (data:image/png;base64,...)",
+        ));
+    }
+    let img = mimo26_image::decode_data_url(url).map_err(|e| ApiError::bad_request(format!("image: {e}")))?;
+    let tokens = mimo26_image::merged_tokens(img.height, img.width).map_err(|e| ApiError::bad_request(format!("image: {e}")))?;
+    Ok(crate::engine::ImageInput { hash: fnv1a(url.as_bytes()), tokens, width: img.width, height: img.height, rgb: img.data })
+}
+
+fn flatten_content(content: &Json, images: &mut Images) -> Result<String, ApiError> {
     match content {
-        Json::Str(s) => Ok(s.clone()),
+        Json::Str(s) => Ok(clean(s)),
         Json::Array(parts) => {
             let mut text = String::new();
             for part in parts {
                 let ty = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 if MEDIA_TYPES.contains(&ty) {
                     return Err(ApiError::bad_request(format!(
-                        "content part type \"{ty}\" is not supported (images, audio and video are rejected)"
+                        "content part type \"{ty}\" is not supported (audio and video are rejected)"
                     )));
                 }
+                if IMAGE_TYPES.contains(&ty) {
+                    let i = images.seen;
+                    images.seen += 1;
+                    if i < images.keep_from {
+                        text.push_str(&format!("[image omitted: only the {MAX_IMAGES} most recent images are sent]"));
+                        continue;
+                    }
+                    let url = image_url(part).ok_or_else(|| ApiError::bad_request("an image part has no URL"))?;
+                    let img = decode_image(url)?;
+                    text.push_str(&crate::engine::image_marker(&img));
+                    images.out.push(std::sync::Arc::new(img));
+                    continue;
+                }
                 if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                    text.push_str(t);
+                    text.push_str(&clean(t));
                 }
             }
             Ok(text)
@@ -151,10 +201,16 @@ fn flatten_content(content: &Json) -> Result<String, ApiError> {
     }
 }
 
-fn parse_message(v: &Json) -> Result<ChatMessage, ApiError> {
+/// Image parts in a request's messages (counted before parsing, to keep the newest).
+fn count_images(messages: &[Json]) -> usize {
+    messages.iter().filter_map(|m| m.get("content").and_then(|c| c.as_array())).flatten()
+        .filter(|p| IMAGE_TYPES.contains(&p.get("type").and_then(|t| t.as_str()).unwrap_or(""))).count()
+}
+
+fn parse_message(v: &Json, images: &mut Images) -> Result<ChatMessage, ApiError> {
     let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("").to_string();
     let content = match v.get("content") {
-        Some(c) => flatten_content(c)?,
+        Some(c) => flatten_content(c, images)?,
         None => String::new(),
     };
     let mut tool_calls = Vec::new();
@@ -201,8 +257,12 @@ impl ChatRequest {
     /// Decode and validate a parsed request body.
     pub fn parse(body: &Json) -> Result<ChatRequest, ApiError> {
         let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
+        let mut images = Images { seen: 0, keep_from: 0, out: Vec::new() };
         let messages = match body.get("messages").and_then(|m| m.as_array()) {
-            Some(ms) => ms.iter().map(parse_message).collect::<Result<Vec<_>, _>>()?,
+            Some(ms) => {
+                images.keep_from = count_images(ms).saturating_sub(MAX_IMAGES);
+                ms.iter().map(|m| parse_message(m, &mut images)).collect::<Result<Vec<_>, _>>()?
+            }
             None => return Err(ApiError::bad_request("missing messages array")),
         };
         if messages.is_empty() {
@@ -247,6 +307,7 @@ impl ChatRequest {
             include_usage,
             enable_thinking,
             parallel_tool_calls,
+            images: images.out,
         })
     }
 }

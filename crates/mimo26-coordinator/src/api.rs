@@ -5,16 +5,17 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
-use mimo26_api::engine::{Engine, GenerateOutcome, GenerateParams};
+use mimo26_api::engine::{Engine, GenerateOutcome, GenerateParams, ImageInput, IMAGE_CLOSE, IMAGE_OPEN};
 use mimo26_api::types::{ChatMessage, Tool, ToolCall};
 
 use crate::config::Config;
-use crate::dforward::{device_free_bytes, DeviceForward, DeviceKv, BATCH_ROWS, DFLASH_DRAFTS, KV_MARGIN_BYTES};
+use crate::dforward::{device_free_bytes, DeviceForward, DeviceKv, EmbedOverlay, BATCH_ROWS, DFLASH_DRAFTS, KV_MARGIN_BYTES};
 use crate::hostcache::{HostCache, Kind};
 use mimo26_attn::device::DeviceBuffer;
 use crate::serving::{Fp8KvCache, ServingModel};
 use crate::streaming::flush_pending;
 use crate::tokenizer::BpeTokenizer;
+use crate::vision::VisionTower;
 use crate::wire::WireClient;
 use crate::{greedy, Role};
 
@@ -86,6 +87,8 @@ pub struct CoordinatorEngine {
     /// The longest request one slot can hold with the rest of the pool idle
     /// (measured at startup from free GPU memory; device backend only).
     max_context: Option<usize>,
+    /// `<|vision_start|>` and `<|vision_end|>` when the image encoder is loaded (perf reset V2).
+    vision_tokens: Option<(u32, u32)>,
 }
 
 /// One generation for the scheduler: the prompt, the token budget, the channel
@@ -95,6 +98,81 @@ struct Job {
     max_tokens: usize,
     tx: mpsc::Sender<Result<usize, String>>,
     cancel: Arc<AtomicBool>,
+    images: Vec<ImageSpan>,
+}
+
+/// An image in a prompt (perf reset V2): the prompt's image tokens `[start, start + tokens)`
+/// take the encoder's rows for `image`.
+struct ImageSpan {
+    start: usize,
+    image: Arc<ImageInput>,
+}
+
+/// The token id standing for row `i` of the image with hash `hash` (perf reset V2): past any
+/// vocabulary (bit 31 set), and a function of the image's bytes, so the prefix caches, which
+/// compare token ids, share a prompt only when its images are the same.
+pub fn image_token_id(hash: u64, i: usize) -> u32 {
+    let mut x = hash ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    x ^= x >> 33;
+    0x8000_0000 | (x as u32 & 0x7fff_ffff)
+}
+
+/// Encode a rendered prompt whose images stand as markers (`IMAGE_OPEN` hash `:` tokens
+/// `IMAGE_CLOSE`, placed by the API): the text between them is encoded as usual, and each marker
+/// becomes `<|vision_start|>`, its image token ids, `<|vision_end|>` — what the chat template's
+/// `<|vision_start|><|image_pad|><|vision_end|>` encodes to once the processor expands the pad.
+/// Special tokens split the text, so encoding the pieces apart matches encoding the whole.
+fn encode_marked(tok: &BpeTokenizer, vision: Option<(u32, u32)>, text: &str) -> Vec<u32> {
+    let Some((start, end)) = vision.filter(|_| text.contains(IMAGE_OPEN)) else { return tok.encode(text) };
+    let mut ids = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(IMAGE_OPEN) {
+        let after = &rest[i + IMAGE_OPEN.len_utf8()..];
+        let Some(j) = after.find(IMAGE_CLOSE) else { break };
+        let parsed = after[..j].split_once(':').and_then(|(h, n)| Some((u64::from_str_radix(h, 16).ok()?, n.parse::<usize>().ok()?)));
+        let Some((hash, n)) = parsed else { break };
+        if i > 0 {
+            ids.extend(tok.encode(&rest[..i]));
+        }
+        ids.push(start);
+        ids.extend((0..n).map(|k| image_token_id(hash, k)));
+        ids.push(end);
+        rest = &after[j + IMAGE_CLOSE.len_utf8()..];
+    }
+    if !rest.is_empty() {
+        ids.extend(tok.encode(rest));
+    }
+    ids
+}
+
+/// Where each image of a request sits in its prompt: the runs of image token ids, matched in
+/// order against the request's images by length and first id.
+fn image_spans(ids: &[usize], images: &[Arc<ImageInput>]) -> Result<Vec<ImageSpan>, String> {
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < ids.len() {
+        if ids[i] < 0x8000_0000 {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < ids.len() && ids[i] >= 0x8000_0000 {
+            i += 1;
+        }
+        let Some(img) = images.get(spans.len()) else { return Err("the prompt has more images than the request".into()) };
+        if i - start != img.tokens || ids[start] != image_token_id(img.hash, 0) as usize {
+            return Err(format!("image {} does not match its place in the prompt", spans.len()));
+        }
+        spans.push(ImageSpan { start, image: img.clone() });
+    }
+    if spans.len() != images.len() {
+        return Err(format!("{} images in the request, {} in the prompt", images.len(), spans.len()));
+    }
+    Ok(spans)
 }
 
 /// Sets a job's cancel flag when the caller stops reading (stop string, client
@@ -135,6 +213,9 @@ struct Prefilling {
     max: usize,
     tx: mpsc::Sender<Result<usize, String>>,
     cancel: Arc<AtomicBool>,
+    /// The prompt's images (perf reset V2) and, once a segment needs them, their encoded rows.
+    images: Vec<ImageSpan>,
+    overlay: Option<EmbedOverlay>,
 }
 
 /// A retained snapshot on the device (perf reset K3, the design's device banks):
@@ -189,6 +270,35 @@ impl Retained {
 /// Snapshots shorter than this are neither retained nor stored (recomputing
 /// them is cheap; the design's `--host-cache-min-tokens`).
 const MIN_RETAIN: usize = 512;
+
+/// The encoded rows of the images of `p` that its remaining prefill reaches (perf reset V2).
+fn encode_images(pool: &mut Pool, vision: Option<&VisionTower>, p: &Prefilling) -> Result<EmbedOverlay, String> {
+    let tower = vision.ok_or("this server has no image encoder loaded")?;
+    let spans: Vec<&ImageSpan> = p.images.iter().filter(|s| s.start + s.image.tokens > p.done).collect();
+    let most = spans.iter().map(|s| s.image.tokens * 4).max().unwrap_or(0);
+    pool.make_room_bytes(tower.weight_bytes() + VisionTower::scratch_bytes(most))?;
+    let t0 = std::time::Instant::now();
+    let dev = tower.upload()?;
+    let mut overlay = EmbedOverlay::default();
+    for span in spans {
+        let img = &span.image;
+        let t1 = std::time::Instant::now();
+        let rgb = mimo26_image::RgbImage { width: img.width, height: img.height, data: img.rgb.clone() };
+        let patches = mimo26_image::preprocess(&rgb).map_err(|e| format!("image: {e}"))?;
+        let n = (patches.grid_h * patches.grid_w) as usize;
+        if n / 4 != img.tokens {
+            return Err(format!("image grid {}x{} gives {} tokens, the prompt has {}", patches.grid_h, patches.grid_w, n / 4,
+                img.tokens));
+        }
+        let t2 = std::time::Instant::now();
+        let (rows, _) = dev.encode(&patches.data, patches.grid_h as usize, patches.grid_w as usize, false)?;
+        eprintln!("[vision] {}x{} image, {} tokens: preprocess {:.0} ms, encode {:.0} ms", img.width, img.height,
+            img.tokens, (t2 - t1).as_secs_f64() * 1e3, t2.elapsed().as_secs_f64() * 1e3);
+        overlay.spans.push((span.start, rows));
+    }
+    eprintln!("[vision] {} image(s) in {:.0} ms (weights upload included)", overlay.spans.len(), t0.elapsed().as_secs_f64() * 1e3);
+    Ok(overlay)
+}
 
 /// GA rows reserved at admission beyond the prompt: the first output tokens plus
 /// a verify block (ARCHITECTURE §11.1: prompt + min(max_tokens, 8192), growing
@@ -291,6 +401,20 @@ impl Pool {
                         return Err(e);
                     }
                 }
+            }
+        }
+    }
+
+    /// `bytes` of free device memory beyond the margin, evicting retained slots (least recently
+    /// used first) while there is not (perf reset V2: the image encoder's transient buffers).
+    fn make_room_bytes(&mut self, bytes: usize) -> Result<(), String> {
+        loop {
+            let free = device_free_bytes()?;
+            if free >= bytes + KV_MARGIN_BYTES {
+                return Ok(());
+            }
+            if !self.evict_lru() {
+                return Err(format!("the image encoder needs {} MiB of GPU memory; {} MiB is free", bytes >> 20, free >> 20));
             }
         }
     }
@@ -578,6 +702,10 @@ fn start(pool: &mut Pool, active: &mut Vec<Active>, p: Prefilling, next: usize, 
 /// prompt resumes at its longest exact snapshot, on the device (in place or
 /// forked) or restored from RAM, else prefills cold. Only pressure (a bank over
 /// its size, no free slot, or not enough GPU memory) copies snapshots to RAM.
+///
+/// Images (perf reset V2): a prompt's images are encoded when its first segment with image tokens
+/// comes up (none when a snapshot already covers them), after `make_room_bytes` has made room for
+/// the encoder's transient weights and buffers.
 fn scheduler(
     mut fwd: DeviceForward,
     free: Vec<DeviceKv>,
@@ -585,6 +713,7 @@ fn scheduler(
     rx: mpsc::Receiver<Job>,
     vocab: usize,
     eos: Vec<usize>,
+    vision: Option<VisionTower>,
 ) {
     let mut active: Vec<Active> = Vec::new();
     let mut prefilling: std::collections::VecDeque<Prefilling> = std::collections::VecDeque::new();
@@ -655,7 +784,7 @@ fn scheduler(
                 // An exact snapshot: the first token is known, no forward.
                 Some((n, next)) if n == job.ids.len() => {
                     let p = Prefilling { kv, ids: job.ids, done: n, next: Some(next), points, max: job.max_tokens,
-                        tx: job.tx, cancel: job.cancel };
+                        tx: job.tx, cancel: job.cancel, images: Vec::new(), overlay: None };
                     start(&mut pool, &mut active, p, next, &eos);
                 }
                 _ => {
@@ -668,7 +797,7 @@ fn scheduler(
                         continue;
                     }
                     prefilling.push_back(Prefilling { kv, done: resume.map_or(0, |r| r.0), next: None, ids: job.ids,
-                        points, max: job.max_tokens, tx: job.tx, cancel: job.cancel });
+                        points, max: job.max_tokens, tx: job.tx, cancel: job.cancel, images: job.images, overlay: None });
                 }
             }
             pool.enforce_banks(&mut active);
@@ -688,7 +817,7 @@ fn scheduler(
             let mut i = 0;
             while i < prefilling.len() {
                 let r = prefilling[i].ids.len() - prefilling[i].done;
-                if !prefilling[i].cancel.load(Ordering::Relaxed) && rows + r <= BATCH_ROWS {
+                if !prefilling[i].cancel.load(Ordering::Relaxed) && prefilling[i].images.is_empty() && rows + r <= BATCH_ROWS {
                     rows += r;
                     batch.push(prefilling.remove(i).expect("prefilling entry"));
                 } else {
@@ -738,7 +867,25 @@ fn scheduler(
             let len = ((target / sec_per_token) as usize / SEG_QUANTUM * SEG_QUANTUM).clamp(SEG_QUANTUM, SEG_MAX);
             let end = (p.done + len).min(p.ids.len());
             let t0 = std::time::Instant::now();
-            match fwd.forward(&p.ids[p.done..end], &mut p.kv, &mut wire) {
+            // Perf reset V2: the first segment with image tokens encodes the prompt's images.
+            if p.overlay.is_none() && p.ids[p.done..end].iter().any(|&id| id >= vocab) {
+                match encode_images(&mut pool, vision.as_ref(), &p) {
+                    Ok(o) => p.overlay = Some(o),
+                    Err(e) => {
+                        eprintln!("[coordinator] images of a {}-token prompt: {e}", p.ids.len());
+                        let _ = p.tx.send(Err(e));
+                        let mut kv = p.kv;
+                        kv.reset();
+                        let _ = kv.shrink_swa();
+                        pool.release(kv);
+                        continue;
+                    }
+                }
+            }
+            fwd.overlay = p.overlay.take();
+            let result = fwd.forward(&p.ids[p.done..end], &mut p.kv, &mut wire);
+            p.overlay = fwd.overlay.take();
+            match result {
                 Ok(l) => {
                     let next = greedy(&l[l.len() - vocab..]);
                     // The rate at this context length sizes the next segment.
@@ -868,7 +1015,8 @@ impl CoordinatorEngine {
         wire: WireClient,
     ) -> Self {
         let caches = (0..cfg.num_hidden_layers).map(|l| Fp8KvCache::for_layer(&cfg, l)).collect();
-        Self { cfg, backend: Backend::Host { model, caches: Mutex::new(caches), wire: Mutex::new(wire) }, tok, max_context: None }
+        Self { cfg, backend: Backend::Host { model, caches: Mutex::new(caches), wire: Mutex::new(wire) }, tok, max_context: None,
+            vision_tokens: None }
     }
 
     /// The device-resident engine (perf reset R1) behind the batching scheduler
@@ -879,6 +1027,24 @@ impl CoordinatorEngine {
         let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
         let slots = env("MIMO26_MAX_SLOTS", 8).clamp(1, 64);
         let slot_kv = env("MIMO26_SLOT_KV_TOKENS", 4096);
+        // Perf reset V2: the image encoder, in page-locked RAM until an image comes (`MIMO26_VISION=0`: off).
+        let vision = if std::env::var("MIMO26_VISION").map(|v| v == "0").unwrap_or(false) {
+            None
+        } else {
+            let t = std::time::Instant::now();
+            match VisionTower::load_dir(&crate::load::weights_dir()) {
+                Ok(v) => {
+                    eprintln!("[vision] image encoder: {:.2} GB page-locked in {:.1} s", v.weight_bytes() as f64 / 1e9,
+                        t.elapsed().as_secs_f64());
+                    Some(v)
+                }
+                Err(e) => {
+                    eprintln!("[vision] image encoder not loaded: {e}");
+                    None
+                }
+            }
+        };
+        let vision_tokens = vision.as_ref().map(|v| (v.vision_start, v.vision_end));
         let mut free = vec![kv];
         for _ in 1..slots {
             free.push(fwd.new_kv(slot_kv).expect("scheduler KV slot"));
@@ -898,9 +1064,9 @@ impl CoordinatorEngine {
         let (vocab, eos) = (cfg.vocab_size, cfg.eos_token_ids.iter().map(|&x| x as usize).collect());
         std::thread::Builder::new()
             .name("mimo26-scheduler".into())
-            .spawn(move || scheduler(fwd, free, wire, rx, vocab, eos))
+            .spawn(move || scheduler(fwd, free, wire, rx, vocab, eos, vision))
             .expect("spawn scheduler");
-        Self { cfg, backend: Backend::Device { jobs: Mutex::new(tx) }, tok, max_context }
+        Self { cfg, backend: Backend::Device { jobs: Mutex::new(tx) }, tok, max_context, vision_tokens }
     }
 
     /// Host reference path: reset the request state, then run one forward step;
@@ -937,18 +1103,22 @@ impl CoordinatorEngine {
     /// `prompt`'s token ids, from [`LAST_ENCODE`] when it is the prompt just counted.
     fn encode_prompt(&self, prompt: &str) -> Vec<u32> {
         let hit = LAST_ENCODE.with(|c| c.borrow_mut().take().filter(|(p, _)| p == prompt).map(|(_, ids)| ids));
-        hit.unwrap_or_else(|| self.tok.encode(prompt))
+        hit.unwrap_or_else(|| encode_marked(&self.tok, self.vision_tokens, prompt))
     }
 }
 
 impl Engine for CoordinatorEngine {
+    fn vision(&self) -> bool {
+        self.vision_tokens.is_some()
+    }
+
     fn max_context(&self) -> Option<usize> {
         self.max_context
     }
 
     fn tokenize(&self, messages: &[ChatMessage], tools: &[Tool], thinking: bool) -> usize {
         let rendered = self.render_chat(messages, tools, thinking);
-        let ids = self.tok.encode(&rendered);
+        let ids = encode_marked(&self.tok, self.vision_tokens, &rendered);
         let n = ids.len();
         LAST_ENCODE.with(|c| *c.borrow_mut() = Some((rendered, ids)));
         n
@@ -991,7 +1161,8 @@ impl Engine for CoordinatorEngine {
                 let (tx, rx) = mpsc::channel();
                 jobs.lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .send(Job { ids: prompt_ids.clone(), max_tokens: max, tx, cancel: cancel.clone() })
+                    .send(Job { ids: prompt_ids.clone(), max_tokens: max, tx, cancel: cancel.clone(),
+                        images: image_spans(&prompt_ids, &params.images)? })
                     .map_err(|_| "scheduler stopped".to_string())?;
                 Source::Sched { rx, _cancel: CancelOnDrop(cancel.clone()) }
             }
@@ -1166,5 +1337,41 @@ mod tests {
         assert!(m.is_poisoned());
         let g = m.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(*g, 0);
+    }
+}
+
+#[cfg(test)]
+mod vision_tests {
+    use super::{image_spans, image_token_id};
+    use mimo26_api::engine::ImageInput;
+    use std::sync::Arc;
+
+    fn img(hash: u64, tokens: usize) -> Arc<ImageInput> {
+        Arc::new(ImageInput { hash, tokens, width: 64, height: 64, rgb: Vec::new() })
+    }
+
+    #[test]
+    fn image_token_ids_are_past_the_vocabulary_and_follow_the_image() {
+        let a: Vec<u32> = (0..64).map(|i| image_token_id(7, i)).collect();
+        let b: Vec<u32> = (0..64).map(|i| image_token_id(8, i)).collect();
+        assert!(a.iter().chain(&b).all(|&t| t >= 0x8000_0000));
+        assert_ne!(a, b, "different images, different ids");
+        assert_eq!(a, (0..64).map(|i| image_token_id(7, i)).collect::<Vec<_>>(), "same image, same ids");
+    }
+
+    #[test]
+    fn image_spans_locate_each_image_in_order() {
+        let (x, y) = (img(1, 4), img(2, 3));
+        let mut ids: Vec<usize> = vec![10, 11, 151652];
+        ids.extend((0..4).map(|i| image_token_id(1, i) as usize));
+        ids.extend([151653, 12, 151652]);
+        ids.extend((0..3).map(|i| image_token_id(2, i) as usize));
+        ids.extend([151653, 13]);
+        let spans = image_spans(&ids, &[x.clone(), y.clone()]).unwrap();
+        assert_eq!(spans.iter().map(|s| s.start).collect::<Vec<_>>(), vec![3, 10]);
+        // Order, count and length mismatches are errors, never a silent misplacement.
+        assert!(image_spans(&ids, &[y.clone(), x.clone()]).is_err());
+        assert!(image_spans(&ids, &[x.clone()]).is_err());
+        assert!(image_spans(&ids, &[x, img(2, 4)]).is_err());
     }
 }

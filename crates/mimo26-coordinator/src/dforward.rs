@@ -834,6 +834,23 @@ impl DeviceKv {
 }
 
 /// The device-resident serving model.
+/// Image rows of a prompt (perf reset V2): per image, its first prompt position and its encoded
+/// rows (`[tokens, hidden]`, BF16-rounded), which replace the embeddings of the prompt's image
+/// tokens.
+#[derive(Default)]
+pub struct EmbedOverlay {
+    pub spans: Vec<(usize, Vec<f32>)>,
+}
+
+impl EmbedOverlay {
+    fn row(&self, pos: usize, hid: usize) -> Option<&[f32]> {
+        self.spans.iter().find_map(|(start, rows)| {
+            let n = rows.len() / hid;
+            (pos >= *start && pos < start + n).then(|| &rows[(pos - start) * hid..(pos - start + 1) * hid])
+        })
+    }
+}
+
 pub struct DeviceForward {
     cfg: Config,
     dense: DenseDevice,
@@ -851,6 +868,9 @@ pub struct DeviceForward {
     h_idx: Vec<i32>,
     h_wts: Vec<f32>,
     h_embed: Vec<f32>,
+    /// Image rows for the prompt being prefilled (perf reset V2): set by the scheduler around a
+    /// prefill segment whose ids include image tokens.
+    pub overlay: Option<EmbedOverlay>,
     /// Prefill attention kernel: P2 (FlashAttention-2-style FP16, default) or
     /// the P1 A-f32q split kernel (`MIMO26_ATTN_PREFILL=p1`).
     prefill_p2: bool,
@@ -1017,6 +1037,7 @@ impl DeviceForward {
             h_idx: Vec::new(),
             h_wts: Vec::new(),
             h_embed: Vec::new(),
+            overlay: None,
             prefill_p2: std::env::var("MIMO26_ATTN_PREFILL").map(|v| v != "p1").unwrap_or(true),
             fused_prep: std::env::var("MIMO26_ATTN_PREP").map(|v| v != "split").unwrap_or(true),
             decode_lanes: if std::env::var("MIMO26_DECODE_LANES").map(|v| v == "1").unwrap_or(false) { 1 } else { 2 },
@@ -1236,13 +1257,17 @@ impl DeviceForward {
             cap[lane] = aux_from.map(|f| next as isize - f as isize);
             let pos: Vec<i64> = (next as i64..(next + t) as i64).collect();
             self.sc.pos[lane].buf.upload_prefix(bytes_of(&pos)).map_err(cuda::error_string)?;
-            // Embedding rows gathered on the host, one upload per lane.
+            // Embedding rows gathered on the host, one upload per lane. An id past the
+            // vocabulary is an image token (perf reset V2): its row is the image encoder's.
             self.h_embed.clear();
-            for &id in &ids[s..s + t] {
-                if id >= cfg.vocab_size {
-                    return Err(format!("token id {id} out of vocab"));
+            for (k, &id) in ids[s..s + t].iter().enumerate() {
+                if id < cfg.vocab_size {
+                    self.h_embed.extend_from_slice(&self.embed[id * hid..(id + 1) * hid]);
+                } else {
+                    let row = self.overlay.as_ref().and_then(|o| o.row(next + k, hid));
+                    let row = row.ok_or_else(|| format!("token {id} at position {} is not a known image row", next + k))?;
+                    self.h_embed.extend_from_slice(row);
                 }
-                self.h_embed.extend_from_slice(&self.embed[id * hid..(id + 1) * hid]);
             }
             self.sc.h[lane].buf.upload_prefix(bytes_of(&self.h_embed)).map_err(cuda::error_string)?;
             next += t;

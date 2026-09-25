@@ -12,6 +12,9 @@ use crate::types::{self, ApiError, ChatRequest, Tool, ToolCall, MODEL_ID};
 
 pub fn handle<E: Engine + Send + Sync + 'static>(engine: Arc<E>, body: &Json) -> Result<Response, ApiError> {
     let req = ChatRequest::parse(body)?;
+    if !req.images.is_empty() && !engine.vision() {
+        return Err(ApiError::bad_request("this server has no image encoder; image parts are rejected"));
+    }
 
     let prompt_tokens = engine.tokenize(&req.messages, &req.tools, req.enable_thinking);
     if let Some(max) = engine.max_context() {
@@ -28,6 +31,7 @@ pub fn handle<E: Engine + Send + Sync + 'static>(engine: Arc<E>, body: &Json) ->
         stop: req.stop.clone(),
         thinking: req.enable_thinking,
         cancel: Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))),
+        images: req.images.clone(),
     };
 
     let id = format!("chatcmpl-{}", now_nanos());

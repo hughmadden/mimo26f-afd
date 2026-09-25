@@ -1,0 +1,21 @@
+# mimo26-image — vision input for mimo26f-afd. An OpenAI chat `image_url` data
+# URL becomes the exact `pixel_values` the HF image processor would produce:
+#   data URL -> base64 -> PNG/JPEG decode (Pillow-exact) -> EXIF transpose ->
+#   HF convert_to_rgb (alpha over white) -> smart_resize (factor 32) ->
+#   Pillow BICUBIC resize -> rescale/normalize (CLIP mean/std, f32) ->
+#   Qwen2-VL patch order (patch 16, merge 2, temporal 2) -> [N, 1536] f32.
+#
+# Zero third-party dependencies (own inflate, PNG, JPEG, EXIF, resampler).
+# Goldens come from Pillow 12.2 + numpy via tests/gen_goldens.py.
+[package]
+name = "mimo26-image"
+version = "0.1.0"
+edition = "2021"
+description = "Data-URL image decode (PNG/JPEG, Pillow-exact) and HF Qwen2-VL-style pixel_values for MiMo-V2.6-Flash vision input"
+publish = false
+
+[lib]
+name = "mimo26_image"
+path = "src/lib.rs"
+
+[dependencies]

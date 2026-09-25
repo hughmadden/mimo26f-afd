@@ -12,5 +12,6 @@
 | `mimo26-repack` | Expert slice staging for the ranks (`mimo26-repack --rank r`) |
 | `mimo26-load` | Checkpoint loading (fused QKV, scale grids) and the name audit |
 | `mimo26-lanesim` | Discrete-event simulator of the expert path |
+| `mimo26-image` | Vision input: OpenAI `image_url` data URL → PNG/JPEG decode (Pillow-exact) → HF Qwen2-VL `pixel_values` (smart_resize, BICUBIC, CLIP normalize, patch 16 / merge 2 / temporal 2) |
 
 Module map and REUSE allowlist: `../ARCHITECTURE.md` §4–§5.

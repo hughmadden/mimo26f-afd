@@ -7,6 +7,18 @@ without a row is not allowed into the engine tree (AGENTS.md I-Allow).
 |---|---|---|---|---|---|---|
 | _(none yet)_ | | | | | | |
 
+### Vision input rows (perf reset V2, 26 September 2026 AEST)
+
+Reimplemented, not copied. To match libjpeg-turbo bit for bit, the `mimo26-image` JPEG decoder follows two of its behaviours, read from a vendored source tree on the dev host:
+- the block-smoothing kernel's constants, which are transcribed;
+- the 16-bit wrap of the x86-64 AVX2 islow IDCT.
+
+No libjpeg-turbo source file is in this repo. The checkpoint's vision modeling code is never copied either: `harness/vision_ref.py` executes it from the checkpoint directory at run time.
+
+| Unit | Upstream path | Upstream SHA | New path | Delta allowed | Tests that pin it | Date / who |
+|---|---|---|---|---|---|---|
+| JPEG block smoothing (progressive, incompletely refined coefficients); AVX2 islow IDCT wrap | libjpeg-turbo 3.1.0 `jdcoefct.c` (`decompress_smooth_data`), `simd/x86_64/jidctint-avx2.asm`, read-only from `~/.cargo/registry/.../turbojpeg-sys-1.2.0` | libjpeg-turbo 3.1.0 | `crates/mimo26-image/src/jpeg.rs` | reimplementation in Rust; smoothing constants transcribed | `crates/mimo26-image/tests/goldens.rs` (74 JPEG goldens incl. 36 truncated progressive cuts, bit-exact vs Pillow 12.2 / libjpeg-turbo 3.1.4.1) | 2026-09-26 / image subagent + builder |
+
 ### Oracle import rows (P-201, 23 September 2026 AEST)
 
 Upstream `code/` is **git-ignored** in the unpublished port workspace (non-git source) — these

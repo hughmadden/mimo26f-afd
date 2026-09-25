@@ -85,6 +85,7 @@ It is serving when the log shows `[wire] rank r …: fabric <dev> port <p> at <N
 | `MIMO26_PREFILL_CHUNK` | 4096 | Expert rows per lane exchange (2048 restores the old cut) |
 | `MIMO26_HOST_CACHE_GB` | auto: min(32, 40% MemAvailable) | KV RAM tier (§5); 0 = off |
 | `MIMO26_PREFIX_CACHE_ENTRIES` | 24 | Snapshots kept on the GPU per bank (prompt, turn) before the oldest goes to RAM (§5) |
+| `MIMO26_VISION` | on | The image encoder (§5a); `0` = off, and image parts are refused with 400 |
 | `MIMO26_PREFILL_SEGMENT_MS` | 2000 | Prefill segment target while other requests decode (×4 when nothing waits) (§5) |
 | `MIMO26_DFLASH` | on if `dflash/` exists | 0 disables the drafter |
 | `MIMO26_SPEC` | on with a drafter | 0 = one token per decode step |
@@ -134,6 +135,28 @@ Evidence: `runs/20260925-reset/{l1,k3}/RESULT.md`.
 - A prefill abandoned by its client is kept as a snapshot, so a retry of the same prompt resumes where it stopped.
 - Thinking is off unless the request sends `chat_template_kwargs: {enable_thinking: true}`. A stream then carries the think block as `reasoning` deltas, live, and never as content.
 - **Behind a proxy:** a proxy in front of the API (for example LiteLLM) may not forward the SSE keepalives. Clients going through it need a stream idle timeout longer than their longest cold prefill (about 20 minutes at 1M tokens).
+
+## 5a. Images
+
+Chat requests may carry images: Chat Completions `image_url` parts (and `input_image` or `image`) with inline data URLs (`data:image/png;base64,...`). PNG and JPEG are decoded; remote URLs, other formats, audio and video get a 400.
+
+**Each image is preprocessed like the model's HF processor**, then encoded on the coordinator GPU:
+- EXIF orientation; transparency composited on white.
+- Resized so both sides are multiples of 32, between 3,136 and 12,845,056 pixels (Qwen2-VL `smart_resize`).
+- 16-pixel patches, CLIP normalisation.
+- Encoded by the checkpoint's 28-block vision transformer (`crates/mimo26-coordinator/src/vision.rs`).
+- Every 2x2 patch group becomes one prompt position. A 640x480 image is 300 tokens; a 2560x1440 screenshot is 3,600.
+
+**At most 16 images per request.** Older ones are replaced by a text note, so a long conversation keeps working.
+
+**GPU memory.** The encoder's weights (1.46 GB BF16) stay in page-locked RAM and are copied to the GPU only while a request's images are encoded, then freed.
+- An idle server's KV budget and 1M-token context are unchanged.
+- Encoding needs the weights plus about 30 KB per 16-pixel patch; retained snapshots are evicted to RAM to make room.
+- Loading the weights adds about 1.5 GB of page-locked RAM and a few seconds to startup.
+
+**The prefix caches know which image a prompt holds.** An image's positions carry ids derived from its bytes (past the vocabulary), so a follow-up turn about the same image reuses the cache, and a different image never matches.
+
+**Accuracy** (`harness/vision_ref.py` + `examples/vision_check.rs`): against the reference module in FP32, the encoder is within relative L2 2e-2, worst-token cosine 0.994. The reference itself in BF16 is at 7e-2 / 0.933.
 
 ## 6. Fabric and host tuning (optional)
 

@@ -814,3 +814,90 @@ fn streaming_think_block_is_reasoning_only_and_matches_non_stream() {
     assert_eq!(msg.get("content").and_then(|c| c.as_str()), Some(content.as_str()), "stream content = non-stream: {resp}");
     assert_eq!(msg.get("reasoning_content").and_then(|c| c.as_str()), Some(reasoning.as_str()), "{resp}");
 }
+
+/// An 8x8 red PNG (64x64 after smart_resize: 4 image tokens).
+const RED8_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAFElEQVR4nGM8ISfHgA0wYRUdtBIA0MoBFD5jqJkAAAAASUVORK5CYII=";
+
+/// A vision engine stub: replies `<images passed>|<markers in the prompt>|<omitted notes>`, and
+/// the whole rendered text after a `#`.
+struct VisionStub;
+
+impl Engine for VisionStub {
+    fn tokenize(&self, messages: &[ChatMessage], _tools: &[Tool], _thinking: bool) -> usize {
+        messages.iter().map(|m| m.content.len()).sum::<usize>() / 4
+    }
+    fn render_chat(&self, messages: &[ChatMessage], _tools: &[Tool], _thinking: bool) -> String {
+        messages.iter().map(|m| m.content.clone()).collect::<Vec<_>>().join("\n")
+    }
+    fn vision(&self) -> bool {
+        true
+    }
+    fn generate(
+        &self,
+        prompt: &str,
+        params: &GenerateParams,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<GenerateOutcome, String> {
+        let markers = prompt.chars().filter(|&c| c == mimo26_api::engine::IMAGE_OPEN).count();
+        let notes = prompt.matches("[image omitted").count();
+        let text = format!("{}|{markers}|{notes}#{prompt}", params.images.len());
+        on_delta(&text);
+        Ok(GenerateOutcome { text, finish_reason: "stop".into(), completion_tokens: 1 })
+    }
+}
+
+fn vision_reply(parts: &str) -> (u16, String) {
+    let srv = start_engine(VisionStub);
+    let body = format!(r#"{{"model":"mimo-v2.6-flash","messages":[{{"role":"user","content":[{parts}]}}]}}"#);
+    let (status, resp) = http_post(&format!("{}/v1/chat/completions", srv.base), &body);
+    if status != 200 {
+        return (status, resp);
+    }
+    let v = mimo26_api::json::parse(&resp).unwrap();
+    let msg = v.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()).and_then(|c| c.get("message")).unwrap();
+    (status, msg.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string())
+}
+
+/// Perf reset V2: an image part becomes one image marker in the text and one decoded image in the
+/// request, in order; the marker carries the image's token count (8x8 -> 64x64 -> 4 tokens).
+#[test]
+fn image_part_becomes_a_marker_and_an_image() {
+    let img = format!(r#"{{"type":"image_url","image_url":{{"url":"{RED8_PNG}"}}}}"#);
+    let (status, reply) = vision_reply(&format!(r#"{{"type":"text","text":"what colour? "}},{img}"#));
+    assert_eq!(status, 200, "{reply}");
+    let (head, text) = reply.split_once('#').unwrap();
+    assert_eq!(head, "1|1|0", "{reply}");
+    assert!(text.starts_with("what colour? \u{FDD0}") && text.ends_with(":4\u{FDD1}"), "{text:?}");
+}
+
+/// Only the newest MAX_IMAGES images are sent; older ones become a note (ADVISOR-I3 §10.2 item 6).
+#[test]
+fn only_the_newest_sixteen_images_are_kept() {
+    let img = format!(r#"{{"type":"image_url","image_url":{{"url":"{RED8_PNG}"}}}}"#);
+    let parts = vec![img; 17].join(",");
+    let (status, reply) = vision_reply(&parts);
+    assert_eq!(status, 200, "{reply}");
+    assert!(reply.starts_with("16|16|1#[image omitted"), "{reply}");
+}
+
+/// The marker characters cannot come from a client: they are stripped from text.
+#[test]
+fn marker_characters_in_text_are_stripped() {
+    let (status, reply) = vision_reply(r#"{"type":"text","text":"a﷐b﷑c"}"#);
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply, "0|0|0#abc");
+}
+
+/// A remote image URL is refused (the server does not fetch), and an engine without an encoder
+/// refuses image parts.
+#[test]
+fn remote_images_and_images_without_an_encoder_are_400() {
+    let (status, resp) = vision_reply(r#"{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}"#);
+    assert_eq!(status, 400, "{resp}");
+    assert!(resp.contains("data URL"), "{resp}");
+    let srv = start();
+    let body = format!(r#"{{"model":"mimo-v2.6-flash","messages":[{{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"{RED8_PNG}"}}}}]}}]}}"#);
+    let (status, resp) = http_post(&format!("{}/v1/chat/completions", srv.base), &body);
+    assert_eq!(status, 400, "{resp}");
+    assert!(resp.contains("image encoder"), "{resp}");
+}

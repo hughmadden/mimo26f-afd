@@ -53,6 +53,9 @@ pub mod api;
 
 #[cfg(feature = "cuda")]
 pub mod hostcache;
+/// The image encoder (perf reset V2) — `cuda` only.
+#[cfg(feature = "cuda")]
+pub mod vision;
 
 pub use chat::{render_chat, ChatMessage, ChatOptions, ChatToolCall};
 pub use config::{Config, LayerKind as AttnLayerKind, DENSE_LAYER_IDS, GA_LAYER_IDS};

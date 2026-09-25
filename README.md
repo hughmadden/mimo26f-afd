@@ -4,7 +4,7 @@ An inference engine for [XiaomiMiMo/MiMo-V2.6-Flash-RL](https://huggingface.co/X
 
 The GPU runs attention and everything outside the routed experts. The four Sparks run the experts. This split is attention–FFN disaggregation (AFD).
 
-On the reference setup it serves an OpenAI-compatible API with a context of up to 1,048,576 tokens. Compared with the 4-Spark vLLM reference (tensor-parallel across the same four Sparks, without the 5090), it decodes at 110 tok/s on one stream (+54%) and 426 tok/s across sixteen (+61%), and prefills at up to 5,105 tok/s (+72%; +97% at 64K) ([BENCHMARKS.md](BENCHMARKS.md)). The uplift is the added RTX 5090 and the engine together: the GPU takes attention, the KV cache and the drafter off the Sparks, and the engine is written to make that split pay.
+On the reference setup it serves an OpenAI-compatible API, with text and image input, and a context of up to 1,048,576 tokens. Compared with the 4-Spark vLLM reference (tensor-parallel across the same four Sparks, without the 5090), it decodes at 110 tok/s on one stream (+54%) and 426 tok/s across sixteen (+61%), and prefills at up to 5,105 tok/s (+72%; +97% at 64K) ([BENCHMARKS.md](BENCHMARKS.md)). The uplift is the added RTX 5090 and the engine together: the GPU takes attention, the KV cache and the drafter off the Sparks, and the engine is written to make that split pay.
 
 It is written in Rust and handwritten CUDA, with no external Rust crates. It is a research engine and has been tested on one hardware setup (see [Status](#status)).
 
@@ -22,10 +22,14 @@ It is written in Rust and handwritten CUDA, with no external Rust crates. It is 
   - Continuous batching over `MIMO26_MAX_SLOTS` requests (16 on the reference setup).
   - Short prompts arriving together prefill in one pass.
   - Long prefills run in segments of about 2 s, with decode steps for the other streams in between.
+- **Vision (v1.1.0).**
+  - Images arrive as PNG or JPEG in inline data URLs. A dependency-free crate decodes and preprocesses them, matching Pillow bit for bit.
+  - The checkpoint's own vision encoder runs on the coordinator. Its weights stay in page-locked host RAM and are uploaded per request, so the KV budget and the 1,048,576-token context are unchanged.
+  - The language model, the Sparks and the drafter are unchanged.
 
 ## Results
 
-These were measured on the reference setup with tonyd2wild's `mimobench.py` (prompt set v1, temperature 0), vendored in `harness/fleet/tonyd2wild/`. The comparison is the 4-Spark vLLM reference: vLLM TP4 on the same Sparks, without the 5090, using [tonyd2wild's recipe](https://github.com/tonyd2wild/MiMo-V2.6-Flash-DGX-Spark-Recipe) with DFlash k=7. The deltas therefore compare two deployments, and a large part of the uplift is the fifth device. Decode figures are means over the nine prompt categories.
+These were measured on the reference setup with tonyd2wild's `mimobench.py` (prompt set v1, temperature 0), vendored in `harness/fleet/tonyd2wild/`. The comparison is the 4-Spark vLLM reference: vLLM TP4 on the same Sparks, without the 5090, using [tonyd2wild's recipe](https://github.com/tonyd2wild/MiMo-V2.6-Flash-DGX-Spark-Recipe) with DFlash k=7. The deltas therefore compare two deployments, and a large part of the uplift is the fifth device. Decode figures are means over the nine prompt categories. The text numbers were measured on v1.0.0. v1.1.0 adds image input without changing the text path, and its regression battery matches.
 
 | | This engine (4 Sparks + 5090) | 4-Spark vLLM reference | Over the reference |
 |---|---:|---:|---:|
@@ -93,6 +97,7 @@ crates/
   mimo26-repack        expert slice staging for the ranks
   mimo26-load          checkpoint loading (fused QKV, scale grids) and name audit
   mimo26-lanesim       discrete-event simulator of the expert path
+  mimo26-image         image decoding and preprocessing for vision input (PNG/JPEG, Pillow-exact resize)
 oracle/     CPU reference of the model's numerics, and the golden vectors
 spike/      Python reference implementation used to validate the engine on real weights
 harness/    serving checks, vendored bench tools, selftests
@@ -121,7 +126,7 @@ The documents are the project's working record, so read them with three things i
 
 ## Status
 
-- **Serving:** exactly four Spark ranks, one coordinator GPU, text only. Tested on the reference setup only.
+- **Serving:** exactly four Spark ranks and one coordinator GPU, with text and image input (v1.1.0) but no audio or video. Tested on the reference setup only.
 - **Designed but not built:** other topologies (2, 3, 5 or 6 Sparks) and larger coordinator GPUs.
 - **Correctness gates:**
   - against the CPU oracle and golden vectors;
@@ -132,7 +137,7 @@ The documents are the project's working record, so read them with three things i
 
 - **[DS41RT](https://github.com/tpurtell/ds41rt)** by T.J. Purtell ([@wrldsuksgo2mars](https://x.com/wrldsuksgo2mars)): the AFD design this engine follows, the wire format, and the expert prepare and route-reduce units (MIT).
 - **[b12x](https://github.com/local-inference-lab/b12x)** by the b12x authors: the block-scaled MMA primitive and the W4A8 slice schedule behind the B1 kernel (Apache-2.0).
-- **[tonyd2wild's MiMo-V2.6-Flash DGX Spark recipe](https://github.com/tonyd2wild/MiMo-V2.6-Flash-DGX-Spark-Recipe)** by Tech2wild: the vLLM TP4 reference and the vendored bench and stress tools (MIT).
+- **[tonyd2wild's MiMo-V2.6-Flash DGX Spark recipe](https://github.com/tonyd2wild/MiMo-V2.6-Flash-DGX-Spark-Recipe)** by Tech2wild ([@Tech2Wild](https://x.com/Tech2Wild)): the vLLM TP4 reference and the vendored bench and stress tools (MIT).
 - **[@majewskizby](https://x.com/majewskizby)**: the 8-bit drafter-head idea, from the [DeepSeek-V4.1-Flash four-Spark TP4 recipe](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4).
 - **The Xiaomi MiMo team**: the model and its drafters.
 

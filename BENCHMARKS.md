@@ -1,6 +1,6 @@
 # Benchmarks
 
-These numbers were measured on 26 September 2026, on the v1 build, on the reference setup below. They will be re-measured for each release tag. The step-by-step history, with the build behind each row, is in [docs/design/perf-reset-vs-ds41rt.md](docs/design/perf-reset-vs-ds41rt.md) §6.
+These numbers were measured on 26 September 2026 on the v1.0.0 build, on the reference setup below. v1.1.0 adds image input without changing the text path; its regression battery matches, so the numbers stand for v1.1.0. They will be re-measured when a release changes the text path. The step-by-step history, with the build behind each row, is in [docs/design/perf-reset-vs-ds41rt.md](docs/design/perf-reset-vs-ds41rt.md) §6.
 
 ## Reference setup
 
@@ -67,6 +67,19 @@ On long prompts, the ranks' partial outputs arriving at the coordinator's NIC se
 
 - **Restores.** A restore from the RAM tier takes about 42 ms per 130K tokens.
 - **Exact prefixes only.** A prompt that shares only part of a snapshot prefills cold. MiMo's sliding-window state cannot be rebuilt at an arbitrary position.
+
+## Vision (v1.1.0)
+
+- **Input:** PNG or JPEG as inline data URLs: OpenAI `image_url` or `input_image` parts, or Anthropic base64 image blocks through a gateway.
+  - Remote URLs are not fetched, and they get a 400, as do audio and video.
+  - Up to 16 images per request. Older ones are replaced by a note.
+- **Encoder:** the checkpoint's own vision transformer, on the coordinator GPU. Its weights (1.46 GB) stay in page-locked host RAM and are uploaded per request.
+- **Accuracy against the FP32 reference module:**
+  - relative L2 error 1.5–1.7 × 10⁻²;
+  - worst-token cosine similarity at least 0.99.
+  - For scale, the reference module itself in BF16 is at 7–9 × 10⁻².
+- **Cost:** 30–100 ms per request for the image upload and encode on the 5090. A 640×480 image is 300 tokens.
+- **Checks on the release build:** `harness/l5_vision.py` passed 6 of 6 end to end, and the API contract passed 5 of 5.
 
 ## Memory
 

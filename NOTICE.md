@@ -32,5 +32,6 @@ This repository is MIT-licensed ([LICENSE](LICENSE)). The components below come 
 
 ## Not included
 
+- **Image decoding:** the vision input reimplements the behaviour of libjpeg-turbo and Pillow. No code from either is included; `docs/REUSE.md` records the provenance.
 - **The model:** the MiMo-V2.6-Flash-RL weights and drafters are distributed by Xiaomi under the model's own licence.
 - **CUDA:** the toolkit and cuBLAS are linked at build and run time.

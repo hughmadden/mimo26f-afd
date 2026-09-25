@@ -21,3 +21,4 @@ name = "mimo26_api"
 path = "src/lib.rs"
 
 [dependencies]
+mimo26-image = { path = "../mimo26-image" }

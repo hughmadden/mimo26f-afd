@@ -30,6 +30,7 @@ default = []
 cuda = ["mimo26-attn/cuda", "mimo26-rdma/rdma"]
 
 [dependencies]
+mimo26-image = { path = "../mimo26-image" }
 # RDMA RC transport for the expert exchange (perf reset R2 part 2; rdma feature under cuda).
 mimo26-rdma = { path = "../mimo26-rdma" }
 # The attention twin (attention/RoPE/KV cache) — the coordinator owns attention
@@ -64,4 +65,8 @@ required-features = ["cuda"]
 
 [[example]]
 name = "dense_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "vision_check"
 required-features = ["cuda"]
