@@ -1,0 +1,46 @@
+# mimo26-spark (I5 Track S) — the Spark expert-rank daemon.
+#
+# ADVISOR-I5 §3.1 / §6 (KERNEL-LEAD). What this crate owns:
+#   - the Rust->CUDA FFI surface for the layout-v2 expert kernels (ffi.rs,
+#     mirroring kernels/include/mimo26_expert_kernels.h);
+#   - the serving daemon: layout-v2 slice residency + boot identity readback,
+#     decode via the R18c mixed-M dispatch, prefill via B2 E-FP32, and the
+#     DS41RTE3 v3 wire server with the full network L4 ladder.
+#
+# The FFI declarations below compile on the CPU merge gate with no nvcc: the
+# CUDA symbols are only resolved when the serving binary links the compiled
+# kernel object (a separate, feature-gated build step, not part of `cargo test`).
+#
+# Writers do not run cargo/nvcc (mimo26f-build: scripts/dev.sh only).
+[package]
+name = "mimo26-spark"
+version = "0.1.0"
+edition = "2021"
+description = "Spark expert-rank daemon: layout-v2 slice residency, Rust->CUDA FFI to the expert FFN kernels, DS41RTE3 v3 wire serving (I5 Track S)"
+publish = false
+
+[lib]
+name = "mimo26_spark"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mimo26-spark"
+path = "src/main.rs"
+
+[features]
+default = []
+# Compile + link the expert CUDA kernels via build.rs (needs nvcc + a GPU to
+# run the device smoke). Off by default so `cargo test --workspace` is nvcc-free.
+cuda = ["mimo26-rdma/rdma"]
+
+[dependencies]
+# RDMA RC transport for the expert exchange (perf reset R2 part 2; rdma feature under cuda).
+mimo26-rdma = { path = "../mimo26-rdma" }
+mimo26-expert = { path = "../mimo26-expert" }
+mimo26-load = { path = "../mimo26-load" }
+mimo26-repack = { path = "../mimo26-repack" }
+mimo26-wire = { path = "../mimo26-wire" }
+
+[[example]]
+name = "b1_bench"
+required-features = ["cuda"]

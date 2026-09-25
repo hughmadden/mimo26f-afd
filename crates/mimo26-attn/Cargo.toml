@@ -1,0 +1,35 @@
+# mimo26-attn (I3-A5) — coordinator attention + KV kernels (ADVISOR-I3 §3 A5/A10,
+# ARCHITECTURE.md §11.7/§11.9, ITERATION.md "P-300 revision" I3 row).
+#
+# The CPU half (this crate's Rust twin) is the golden-locked twin of
+# `oracle/mimo26` (I-Gold: consumed read-only, never forked); the GPU half lives
+# in kernels/ (handwritten CUDA, sm_89-correct, sm_120/121 AOT-gated).
+#
+# Writers do not run cargo/nvcc (mimo26f-build: scripts/dev.sh only). Two-run
+# trap suite convention:
+#   CORRECT: scripts/dev.sh check                 (must be green)
+#   NAIVE:   MIMO26_SPIKE_NAIVE=1 <same>          (every NEGATIVE test listed in
+#            tests/ must FAIL; every BOTH-RUNS test passes)
+# GPU parity (captain-fired on dev-host RTX 4090 sm_89):
+#   scripts/dev.sh test attn   ->  tests/gpu/run_gpu_parity.sh (see README).
+[package]
+name = "mimo26-attn"
+version = "0.1.0"
+edition = "2021"
+description = "GQA+SWA+sink attention, FP8 KV (T18/T20), RoPE (T19), paged KV + split-KV decode, AOT gates (A10)"
+publish = false
+
+[lib]
+name = "mimo26_attn"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Compile + link the attention CUDA kernels via build.rs (needs nvcc; a GPU only
+# to run them). Off by default so `cargo test --workspace` is nvcc-free.
+cuda = []
+
+[dependencies]
+# The externally golden-pinned E4M3 codec (fp8_block_golden.json, sha256 pinned in
+# mimo26-load/src/lib.rs) — one codec for weights and KV, never a second copy.
+mimo26-load = { path = "../mimo26-load" }

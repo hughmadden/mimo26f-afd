@@ -1,0 +1,23 @@
+# mimo26-api (A8, I5-R8) — the OpenAI-compatible HTTP/1.1 front door.
+#
+# std-only (no external crates; Cargo.lock stays 8+1). Owned by the kernel-lead;
+# the attn-lead wires the `Engine` trait into the coordinator binary. Serves:
+#   GET  /v1/models
+#   POST /v1/chat/completions  (non-stream + SSE, tool-call parsing T27/T29/T24)
+#
+# The HTTP/1.1 server and the JSON codec are hand-rolled so the crate is
+# dependency-free. The `Engine` trait (tokenize / render_chat / generate with a
+# token callback) is implemented by the coordinator; tests use a stub Engine.
+
+[package]
+name = "mimo26-api"
+version = "0.1.0"
+edition = "2021"
+description = "OpenAI-compatible HTTP/1.1 API (A8): /v1/models + /v1/chat/completions, MiMo tool-call parser, Engine trait"
+publish = false
+
+[lib]
+name = "mimo26_api"
+path = "src/lib.rs"
+
+[dependencies]

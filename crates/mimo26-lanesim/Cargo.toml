@@ -1,0 +1,29 @@
+# mimo26-lanesim (I4 item 7, ADVISOR-I4 §3.2 step 7) — LaneSim: the full expert
+# path simulated against a STUB Spark on a virtual clock. This crate is where the
+# scheduler-facing API gets fixed: submit(layer, rows) -> ticket, poll/collect,
+# and the compact-return sum-conservation law (§3.2 step 5).
+#
+# Every number this crate emits is MODEL (virtual clock + stub Spark + checkpoint
+# geometry). The only MEASURED constants carried are the D7 bar, labelled at their
+# definitions in src/model.rs. Stubs may design, never promote (AGENTS I-Hon).
+#
+# CPU-only and std-only: no wall-clock sleeps, no threads, deterministic event
+# order (time_ns, seq). No dependency on mimo26-wire by design: LaneSim fixes the
+# frame *shapes and sizes* the DS41RTE3 v3 codec must carry (4,360-B request row,
+# 8,192-B compact BF16 return per Spark per token) and mirrors its sequence-number
+# dedup semantics; the captain wires the real codec at integration.
+#
+# Writers do not run cargo (mimo26f-build: scripts/dev.sh only; the captain fires
+# `scripts/dev.sh check`).
+[package]
+name = "mimo26-lanesim"
+version = "0.1.0"
+edition = "2021"
+description = "LaneSim: expert-path discrete-event sim over a stub Spark (virtual clock, deterministic events); fixes the scheduler-facing submit/collect API"
+publish = false
+
+[lib]
+name = "mimo26_lanesim"
+path = "src/lib.rs"
+
+[dependencies]

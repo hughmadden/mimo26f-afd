@@ -1,0 +1,22 @@
+{
+  "synthetic-all-M1": {
+    "seed": 20260924,
+    "steps": [{"layer": 1, "hist": {"1": 256}}]
+  },
+  "synthetic-mixed": {
+    "seed": 20260924,
+    "steps": [{"layer": 1, "hist": {"1": 24, "2": 16, "4": 8, "8": 4}}]
+  },
+  "synthetic-tails": {
+    "seed": 20260924,
+    "steps": [{"layer": 1, "hist": {"1": 8, "9": 8, "17": 8}}]
+  },
+  "synthetic-M16": {
+    "seed": 20260924,
+    "steps": [{"layer": 1, "hist": {"16": 256}}]
+  },
+  "synthetic-M64": {
+    "seed": 20260924,
+    "steps": [{"layer": 1, "hist": {"64": 256}}]
+  }
+}

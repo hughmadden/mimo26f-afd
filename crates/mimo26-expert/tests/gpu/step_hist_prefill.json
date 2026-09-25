@@ -1,0 +1,5 @@
+{
+  "prefill-M1": {"seed": 20260924, "steps": [{"layer": 1, "hist": {"1": 256}}]},
+  "prefill-M16": {"seed": 20260924, "steps": [{"layer": 1, "hist": {"16": 256}}]},
+  "prefill-M64": {"seed": 20260924, "steps": [{"layer": 1, "hist": {"64": 256}}]}
+}

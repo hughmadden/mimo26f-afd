@@ -1,0 +1,21 @@
+# mimo26-load (P-202) — MiMo-V2.6-Flash checkpoint load path.
+#
+# Workspace-root cargo layout per ARCHITECTURE.md §4 (`crates/mimo26-*`): this
+# package is self-contained (std only, zero dependencies) and joins the root
+# workspace manifest when that lands (captain / P-203 ci-cpu). Writers do not
+# run cargo — the captain fires the two-run trap suite:
+#   CORRECT: cargo test                  (must be green)
+#   NAIVE:   MIMO26_SPIKE_NAIVE=1 cargo test   (the *_matches_whole /
+#            *_never_read env-default halves must FAIL; everything else passes)
+[package]
+name = "mimo26-load"
+version = "0.1.0"
+edition = "2021"
+description = "fused-QKV ckpt_tp=4 reconstruction, scale-grid padding trim (T2), model. MTP prefix canonicalisation, fail-loud name audit"
+publish = false
+
+[lib]
+name = "mimo26_load"
+path = "src/lib.rs"
+
+[dependencies]

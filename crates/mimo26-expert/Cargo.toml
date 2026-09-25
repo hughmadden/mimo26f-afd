@@ -1,0 +1,38 @@
+# mimo26-expert (I4 items 3+4) — grouped MXFP4 expert GEMM for the Spark ranks.
+#
+# ADVISOR-I4 §3.1 (the number that decides the project), §3.2 steps 1/3/4, §3.3.
+# ARCHITECTURE.md §3 "Spark ranks own: routed experts (grouped GEMM service)".
+#
+# The expert FFN for ONE quarter slice (TP4EP1): gate/up `[2048, 4096]` and
+# down `[4096, 2048]` in MXFP4 (E2M1 nibbles + E8M0-32 block scales), grouped
+# over experts with M tokens per expert, M in {1,2,4,8,16,64,256}, BF16/f32
+# accumulate. Device-side dequant: u8 -> nibble split with the EVEN element in
+# the LOW nibble (T14), E2M1 16-entry LUT, scale = 2^(e8m0-127) with byte 255
+# clamped to 2^127 (T10), f32-max saturation.
+#
+# The CPU half (this crate's Rust twin) is the golden-locked twin of
+# `spike/mxfp4.py` (I-Gold: consumed READ-ONLY, never imported) and of the
+# pinned quarter-slice layout in `crates/mimo26-repack/src/geom.rs` (READ-ONLY
+# reference — the repack crate is the sole writer of that layout). The GPU half
+# lives in `kernels/` (handwritten CUDA, sm_89-correct, sm_120/121 AOT-gated).
+#
+# Writers do not run cargo/nvcc (mimo26f-build: scripts/dev.sh only). Two-run
+# trap suite convention:
+#   CORRECT: scripts/dev.sh check                 (must be green)
+#   NAIVE:   MIMO26_SPIKE_NAIVE=1 <same>          (every NEGATIVE test listed in
+#            tests/ must FAIL; every BOTH-RUNS test passes)
+# GPU cells (captain-fired):
+#   scripts/dev.sh test gemm unpack   -> tests/gpu/run_gpu_gemm.sh (nibble proof)
+#   scripts/dev.sh test gemm bench    -> the bandwidth harness (§3.1)
+[package]
+name = "mimo26-expert"
+version = "0.1.0"
+edition = "2021"
+description = "Grouped MXFP4 expert GEMM (E2M1+E8M0-32, T10/T14), L3 oracle harness, bandwidth check, sm_121 AOT capacity classes"
+publish = false
+
+[lib]
+name = "mimo26_expert"
+path = "src/lib.rs"
+
+[dependencies]

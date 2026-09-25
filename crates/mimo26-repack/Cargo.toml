@@ -1,0 +1,36 @@
+# mimo26-repack (I4 item 2, ADVISOR-I4 §3.2 step 2 / §3.3) — checkpoint MXFP4
+# expert weights -> the kernel's per-quarter-slice layout, with a sha256 manifest
+# and an identity readback verifier (the I5 G0 boot check).
+#
+# OFFLINE tooling: no GPU, no hardware, no docker, no remote hosts, no network.
+# std-only, zero dependencies (the workspace convention: mimo26-load,
+# mimo26-wire, mimo26-lanesim are all dependency-free).
+#
+# Geometry (ADVISOR-I4 §3.1, confirmed against the real checkpoint headers
+# READ-ONLY on 23 Sep 2026 AEST — see runs/20260923-i4/packets/repack.md):
+#   expert = 3 x 2048 x 4096 MXFP4 = 13,369,344 B
+#   quarter slice = 3,342,336 B; 47 MoE layers (layer 0 dense); 256 experts;
+#   4 EP ranks.
+#
+# Writers do not run cargo (mimo26f-build: scripts/dev.sh only; the captain
+# fires `scripts/dev.sh check`). Two-run trap suite convention:
+#   CORRECT: scripts/dev.sh check                    (must be green)
+#   NAIVE:   MIMO26_SPIKE_NAIVE=1 <same>             (every NEGATIVE test must
+#            FAIL; every BOTH-RUNS test passes). Classification is listed in the
+#            header of each tests/*.rs file.
+[package]
+name = "mimo26-repack"
+version = "0.1.0"
+edition = "2021"
+description = "MXFP4 expert repack to the per-quarter-slice kernel layout, sha256 manifest, identity readback verifier (I4 item 2)"
+publish = false
+
+[lib]
+name = "mimo26_repack"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mimo26-repack"
+path = "src/bin/repack.rs"
+
+[dependencies]

@@ -1,0 +1,67 @@
+# mimo26-coordinator (I5 Track S spine) — coordinator-side model-forward glue.
+#
+# ADVISOR-I5 §6 kick-start: "the model-forward glue (embeddings, the FP32 router
+# (T22), the dense layer-0 FFN, the final norm and lm_head, the sampler …)"
+# none of which exists outside the Python oracle (GLM F1). This crate is the
+# golden-locked Rust twin of `oracle/mimo26/nn/layers.py` — the arithmetic
+# conformance target the later CUDA kernels must match (ARCHITECTURE.md §3).
+#
+# Layout convention (matches the oracle): every weight matrix is row-major
+# [out, in]; `linear(x, w) == x @ w.T`. Functions take dimensions as explicit
+# parameters so the CPU twin is independent of any loader representation.
+[package]
+name = "mimo26-coordinator"
+version = "0.1.0"
+edition = "2021"
+description = "Coordinator-side forward glue: embeddings, RMSNorm, linear, silu, dense FFN, FP32 router (T22), sampler (T23)"
+publish = false
+
+[lib]
+name = "mimo26_coordinator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mimo26-coordinator"
+path = "src/main.rs"
+
+[features]
+default = []
+# Link the attention CUDA kernels (via mimo26-attn/cuda) for the GPU serve path.
+cuda = ["mimo26-attn/cuda", "mimo26-rdma/rdma"]
+
+[dependencies]
+# RDMA RC transport for the expert exchange (perf reset R2 part 2; rdma feature under cuda).
+mimo26-rdma = { path = "../mimo26-rdma" }
+# The attention twin (attention/RoPE/KV cache) — the coordinator owns attention
+# (ARCHITECTURE §3), so the forward loop composes it here.
+mimo26-attn = { path = "../mimo26-attn" }
+# Safetensors header/tensor reading for the coordinator weight-loading path.
+mimo26-repack = { path = "../mimo26-repack" }
+# Fused-QKV TP4 reconstruction + the FP8 e4m3 block dequant (golden-pinned).
+mimo26-load = { path = "../mimo26-load" }
+# DS41RTE3 v3 wire codec + L4 ladder + R8 CoordinatorSum (the Spark expert RPC).
+mimo26-wire = { path = "../mimo26-wire" }
+# OpenAI-compatible A8 API (Engine trait + HTTP front door); the coordinator
+# implements Engine, the API owns the HTTP surface + tool-call parser.
+mimo26-api = { path = "../mimo26-api" }
+
+# GPU examples require the cuda feature (they link cudart/cublas + a GPU).
+[[example]]
+name = "dense_golden"
+required-features = ["cuda"]
+
+[[example]]
+name = "serving_golden"
+required-features = ["cuda"]
+
+[[example]]
+name = "serving_golden_tight"
+required-features = ["cuda"]
+
+[[example]]
+name = "x1a_run"
+required-features = ["cuda"]
+
+[[example]]
+name = "dense_bench"
+required-features = ["cuda"]

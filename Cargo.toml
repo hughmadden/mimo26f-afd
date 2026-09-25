@@ -1,0 +1,5 @@
+# mimo26f-afd Rust workspace (P-203 glue). Crates are mimo26-* per AGENTS §3.
+# L0/L1 merge gate runs `cargo test --workspace` at this root (scripts/ci-cpu.sh).
+[workspace]
+resolver = "2"
+members = ["crates/*"]
