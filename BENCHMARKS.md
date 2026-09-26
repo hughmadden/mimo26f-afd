@@ -1,6 +1,9 @@
 # Benchmarks
 
-These numbers were measured on 26 September 2026 on the v1.0.0 build, on the reference setup below. v1.1.0 adds image input without changing the text path; its regression battery matches, so the numbers stand for v1.1.0. They will be re-measured when a release changes the text path. The step-by-step history, with the build behind each row, is in [docs/design/perf-reset-vs-ds41rt.md](docs/design/perf-reset-vs-ds41rt.md) §6.
+These numbers were measured on 26 September 2026, on the reference setup below.
+
+- **Decode and prefill:** three benchmark runs on the v1.1.0 build. Each cell gives the median, with the range in brackets.
+- **Long-context, cache and memory checks:** measured on v1.1.0 and on v1.1.1. v1.1.1 changes only the RAM tier's eviction order; see Prefix reuse. The step-by-step history, with the build behind each row, is in [docs/design/perf-reset-vs-ds41rt.md](docs/design/perf-reset-vs-ds41rt.md) §6.
 
 ## Reference setup
 
@@ -20,12 +23,12 @@ These numbers were measured on 26 September 2026 on the v1.0.0 build, on the ref
 
 | Streams | This engine (4 Sparks + 5090) | 4-Spark vLLM reference | Over the reference |
 |---|---:|---:|---:|
-| 1 (tok/s per stream) | 110.0 | 71.6 | +54% |
-| 6 (tok/s total) | 274.5 | 166.0 | +65% |
-| 16 (tok/s total) | 426.2 | 264.8 | +61% |
-| 1, mean time to first token | 0.155 s | 0.251 s | 38% sooner |
-| 6, mean time to first token | 0.332 s | 0.606 s | 45% sooner |
-| 16, mean time to first token | 0.650 s | 0.795 s | 18% sooner |
+| 1 (tok/s per stream) | 109.7 (109.6–110.1) | 71.6 | +53% |
+| 6 (tok/s total) | 279.1 (274.3–279.1) | 166.0 | +68% |
+| 16 (tok/s total) | 416.7 (413.7–424.7) | 264.8 | +57% |
+| 1, mean time to first token | 0.152 s | 0.251 s | 39% sooner |
+| 6, mean time to first token | 0.329–0.331 s | 0.606 s | 45–46% sooner |
+| 16, mean time to first token | 0.648–0.663 s | 0.795 s | 17–18% sooner |
 
 - Each decode step verifies the drafter's tokens for as long as the drafter's confidence chain stays at or above τ.
 - The verify step is bound by the Sparks' weight streaming.
@@ -34,38 +37,46 @@ These numbers were measured on 26 September 2026 on the v1.0.0 build, on the ref
 
 | Prompt | This engine (tok/s) | 4-Spark vLLM reference (tok/s) | Over the reference |
 |---|---:|---:|---:|
-| 2K | 3,485 | 2,999 | +16% |
-| 8K | 5,105 | 2,975 | +72% |
-| 32K | 4,799 | 2,671 | +80% |
-| 64K | 4,163 | 2,114 | +97% |
+| 2K | 3,630 (3,391–3,632) | 2,999 | +21% |
+| 8K | 5,123 (5,032–5,125) | 2,975 | +72% |
+| 32K | 4,816 (4,811–4,831) | 2,671 | +80% |
+| 64K | 4,283 (4,281–4,298) | 2,114 | +103% |
 
-On long prompts, the ranks' partial outputs arriving at the coordinator's NIC set the limit. On this host that NIC runs at PCIe x8.
+- **The low 2K reading:** the first 2K run after a restart is the slowest, at 3,391 tok/s.
+- **The limit on long prompts:** the ranks' partial outputs arriving at the coordinator's NIC. On this host that NIC runs at PCIe x8.
 
 ## Long context: one request, cold
 
 | Prompt (tokens) | Time to first token | Prefill rate | Answer |
 |---:|---:|---:|---|
-| 130,279 | 40.6 s | 3,209 tok/s | 3 of 3 codes correct |
-| 260,284 | 107.8 s | 2,415 tok/s | 3 of 3 codes correct |
-| 521,325 | 333.2 s | 1,565 tok/s | 3 of 3 codes correct |
-| 993,795 | 1,049.3 s | 947 tok/s | 3 of 3 codes correct |
+| 63,851 | 14.9 s | 4,294 tok/s | 3 of 3 codes correct |
+| 130,301 | 37.6 s | 3,465 tok/s | 3 of 3 codes correct |
+| 260,306 | 104.4 s | 2,492 tok/s | 3 of 3 codes correct |
+| 521,347 | 327.8 s | 1,590 tok/s | 3 of 3 codes correct |
+| 993,795 | 1,037.0 s | 958 tok/s | 3 of 3 codes correct |
 
 - **Why the rate falls with length.** Attention over the global layers grows with context, and it all runs on the one GPU.
-- **Other streams keep decoding.** Prefill runs in segments of about 2 s, with decode steps for the other streams in between. During a 128K prefill, a decoding stream's largest gap is about 4 s; before segmentation it stalled for the whole 44 s.
+- **Other streams keep decoding.** Prefill runs in segments of about 2 s, with decode steps for the other streams in between. During a 128K prefill, a decoding stream's largest gap is 4.1 s; before segmentation it stalled for the whole 44 s.
 
 ## Prefix reuse
 
-| Case | Time to first token |
-|---|---:|
-| 64K prompt, cold | 15.0 s |
-| 64K follow-up turn (exact prefix, GPU snapshot) | 0.165 s |
-| 64K exact repeat | 0.042 s |
-| 128K follow-up turn | 0.28 s |
-| 993,795-token prompt, follow-up turn | 1.04 s |
-| 993,795-token prompt, exact repeat | 0.87 s |
-| 10 conversations of 128K under memory pressure | 30 of 30 correct, returns ≤ 0.46 s |
+| Prompt (tokens) | Cold | Follow-up turn | Exact repeat |
+|---:|---:|---:|---:|
+| 63,851 | 14.9 s | 0.159 s | 0.041 s |
+| 130,301 | 37.6 s | 0.222 s | 0.081 s |
+| 260,306 | 104.4 s | 0.346 s | 0.229 s |
+| 521,347 | 327.8 s | 0.593 s | 0.455 s |
+| 993,795 | 1,037.0 s | 1.050 s | 0.871 s |
 
-- **Restores.** A restore from the RAM tier takes about 42 ms per 130K tokens.
+At about 1M tokens, most of a warm turn is spent tokenising the prompt once, about 0.7 s.
+
+**Under memory pressure** (v1.1.1), with 10 conversations of 128K each:
+- **Correctness:** 30 of 30.
+- **Returns:** the longest took 0.317 s.
+- **Exact repeats:** the longest took 0.147 s. All came from the RAM tier, and the outputs were identical.
+- **Restores:** 42–46 ms per 130–139K tokens from the RAM tier.
+
+**The v1.1.1 fix.** Under RAM pressure, v1.1.0's RAM tier evicted every prompt snapshot before any turn snapshot. That could drop a fresh conversation's prompt snapshot while a stale conversation's turn survived, so an exact repeat (a retry, a regenerate, an agent resending a prompt) prefilled cold: 38–41 s at 128K. v1.1.1 evicts the least recently used snapshot first.
 - **Exact prefixes only.** A prompt that shares only part of a snapshot prefills cold. MiMo's sliding-window state cannot be rebuilt at an arbitrary position.
 
 ## Vision (v1.1.0)
@@ -98,4 +109,7 @@ The commands are in [docs/DEPLOY.md](docs/DEPLOY.md) §7.
 - **Batched prefill:** first tokens match solo runs in 29 of 30 cases. The one difference is a near-tie.
 - **Prefix reuse and KV pressure.**
 - **Head-of-line.**
-- **Top of memory:** 4 of 4, at 256K under a GPU ballast and at about 1M.
+- **Top of memory:** 4 of 4 at 256K under a 9 GiB GPU ballast.
+  - The exact repeat rewinds in place on the GPU in 0.23 s.
+  - A 6K follow-up that cannot grow in place is relocated through RAM in 4.2 s; 260K tokens restore in 81–82 ms.
+  - The repeat from RAM takes 0.26 s.

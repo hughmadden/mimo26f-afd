@@ -4,7 +4,7 @@ An inference engine for [XiaomiMiMo/MiMo-V2.6-Flash-RL](https://huggingface.co/X
 
 The GPU runs attention and everything outside the routed experts. The four Sparks run the experts. This split is attention–FFN disaggregation (AFD).
 
-On the reference setup it serves an OpenAI-compatible API, with text and image input, and a context of up to 1,048,576 tokens. Compared with the 4-Spark vLLM reference (tensor-parallel across the same four Sparks, without the 5090), it decodes at 110 tok/s on one stream (+54%) and 426 tok/s across sixteen (+61%), and prefills at up to 5,105 tok/s (+72%; +97% at 64K) ([BENCHMARKS.md](BENCHMARKS.md)). The uplift is the added RTX 5090 and the engine together: the GPU takes attention, the KV cache and the drafter off the Sparks, and the engine is written to make that split pay.
+On the reference setup it serves an OpenAI-compatible API, with text and image input, and a context of up to 1,048,576 tokens. Compared with the 4-Spark vLLM reference (tensor-parallel across the same four Sparks, without the 5090), it decodes at 110 tok/s on one stream (+53%) and 417 tok/s across sixteen (+57%), and prefills at up to 5,123 tok/s (+72%; +103% at 64K) ([BENCHMARKS.md](BENCHMARKS.md)). The uplift is the added RTX 5090 and the engine together: the GPU takes attention, the KV cache and the drafter off the Sparks, and the engine is written to make that split pay.
 
 It is written in Rust and handwritten CUDA, with no external Rust crates. It is a research engine and has been tested on one hardware setup (see [Status](#status)).
 
@@ -17,7 +17,7 @@ It is written in Rust and handwritten CUDA, with no external Rust crates. It is 
   - Each request's KV grows on demand inside one GPU pool.
   - Admission reserves the prompt plus 1K–8K output rows (from `max_tokens`). A prompt at or over the maximum context is refused with a 400.
   - Prompt and turn ends are kept as snapshots. A follow-up with an exact prefix resumes from the GPU copy. When memory is short, it resumes from a page-locked RAM tier (up to 32 GiB) instead.
-  - A 64K follow-up turn starts in 0.17 s. Cold, the same prompt takes 15 s.
+  - A 64K follow-up turn starts in 0.16 s. Cold, the same prompt takes 15 s.
 - **Serving.**
   - Continuous batching over `MIMO26_MAX_SLOTS` requests (16 on the reference setup).
   - Short prompts arriving together prefill in one pass.
@@ -29,17 +29,17 @@ It is written in Rust and handwritten CUDA, with no external Rust crates. It is 
 
 ## Results
 
-These were measured on the reference setup with tonyd2wild's `mimobench.py` (prompt set v1, temperature 0), vendored in `harness/fleet/tonyd2wild/`. The comparison is the 4-Spark vLLM reference: vLLM TP4 on the same Sparks, without the 5090, using [tonyd2wild's recipe](https://github.com/tonyd2wild/MiMo-V2.6-Flash-DGX-Spark-Recipe) with DFlash k=7. The deltas therefore compare two deployments, and a large part of the uplift is the fifth device. Decode figures are means over the nine prompt categories. The text numbers were measured on v1.0.0. v1.1.0 adds image input without changing the text path, and its regression battery matches.
+These were measured on the reference setup with tonyd2wild's `mimobench.py` (prompt set v1, temperature 0), vendored in `harness/fleet/tonyd2wild/`. The comparison is the 4-Spark vLLM reference: vLLM TP4 on the same Sparks, without the 5090, using [tonyd2wild's recipe](https://github.com/tonyd2wild/MiMo-V2.6-Flash-DGX-Spark-Recipe) with DFlash k=7. The deltas therefore compare two deployments, and a large part of the uplift is the fifth device. Decode figures are means over the nine prompt categories. Each cell is the median of three runs on the v1.1.0 build.
 
 | | This engine (4 Sparks + 5090) | 4-Spark vLLM reference | Over the reference |
 |---|---:|---:|---:|
-| Decode, 1 stream (tok/s per stream) | 110.0 | 71.6 | +54% |
-| Decode, 6 streams (tok/s total) | 274.5 | 166.0 | +65% |
-| Decode, 16 streams (tok/s total) | 426.2 | 264.8 | +61% |
-| Time to first token, 16 streams (mean) | 0.65 s | 0.80 s | 18% sooner |
-| Cold prefill 2K / 8K / 32K / 64K (tok/s) | 3,485 / 5,105 / 4,799 / 4,163 | 2,999 / 2,975 / 2,671 / 2,114 | +16 / +72 / +80 / +97% |
+| Decode, 1 stream (tok/s per stream) | 109.7 | 71.6 | +53% |
+| Decode, 6 streams (tok/s total) | 279.1 | 166.0 | +68% |
+| Decode, 16 streams (tok/s total) | 416.7 | 264.8 | +57% |
+| Time to first token, 16 streams (mean) | 0.65–0.66 s | 0.80 s | 17–18% sooner |
+| Cold prefill 2K / 8K / 32K / 64K (tok/s) | 3,630 / 5,123 / 4,816 / 4,283 | 2,999 / 2,975 / 2,671 / 2,114 | +21 / +72 / +80 / +103% |
 
-A 130K-token prompt prefills in 41 s, and a 993,795-token prompt in 17.5 minutes. Both answer correctly. [BENCHMARKS.md](BENCHMARKS.md) has the method, the long-context and cache results, and the correctness checks.
+A 130K-token prompt prefills in 38 s, and a 993,795-token prompt in 17.3 minutes. Both answer correctly. [BENCHMARKS.md](BENCHMARKS.md) has the method, the long-context and cache results, and the correctness checks.
 
 ## Requirements
 

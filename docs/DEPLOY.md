@@ -120,7 +120,7 @@ Leave these unset in production:
   - a bank over `MIMO26_PREFIX_CACHE_ENTRIES`;
   - no free slot;
   - not enough GPU memory for a request.
-- **RAM eviction deletes:** prompts first, then turns, oldest first.
+- **RAM eviction deletes:** the least recently used snapshot first; at equal use, a prompt snapshot before a turn snapshot. DS41RT deletes every prompt snapshot before any turn snapshot, but a prompt snapshot shares its pages with its turn snapshot, so under page pressure that order wiped out recent prompt snapshots while stale turns stayed (`runs/20260926-v110`).
 - **Exact prefixes only.** A prompt that shares only part of a snapshot (e.g. the same system prompt with a different question) prefills cold. MiMo's SWA state cannot be rebuilt at an arbitrary position (trap T17).
 
 Evidence: `runs/20260925-reset/{l1,k3}/RESULT.md`.

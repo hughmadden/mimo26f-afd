@@ -7,9 +7,18 @@
 //! device-side): with no pressure nothing is copied to RAM. When the device
 //! evicts a point (a bank over its size, or a slot or its memory needed), the
 //! scheduler stores it here; a returning conversation that misses the device
-//! restores from here instead of prefilling. RAM eviction deletes: prompt
-//! snapshots before turn snapshots, oldest first (the engine's
-//! `Retention::evict_one` order).
+//! restores from here instead of prefilling. RAM eviction deletes the least
+//! recently used snapshot first; at equal use a prompt snapshot goes before a
+//! turn snapshot (`victim`).
+//!
+//! That departs from the engine's `Retention::evict_one` order (every prompt
+//! snapshot before any turn snapshot, perf reset V2 measurement, 26 September).
+//! A prompt snapshot shares its pages with its conversation's turn snapshot, so
+//! deleting it frees a state but no pages. Under page pressure that order
+//! deleted every prompt snapshot, the fresh ones included, before the first
+//! stale turn snapshot, and an exact repeat of a recent prompt (a retry, a
+//! regenerate, identical subagent prompts) prefilled from cold: `l5_kv_pressure`
+//! after the 64K-1M ladder, repeats 37-41 s instead of ~0.2 s.
 //!
 //! A snapshot is a request's KV state at an exact position:
 //! - the GA rows of the 9 full-attention layers, stored as 256-token pages
@@ -207,11 +216,9 @@ impl HostCache {
         Ok(Some(me))
     }
 
-    /// Evict one snapshot: the oldest prompt snapshot, else the oldest turn
-    /// snapshot; false when none is left.
+    /// Evict one snapshot ([`victim`]); false when none is left.
     fn evict_one(&mut self) -> bool {
-        let Some(i) = (0..self.snaps.len()).min_by_key(|&i| (self.snaps[i].kind == Kind::Turn, self.snaps[i].last_use))
-        else {
+        let Some(i) = victim(self.snaps.iter().map(|s| (s.kind, s.last_use))) else {
             return false;
         };
         let s = self.snaps.swap_remove(i);
@@ -410,9 +417,27 @@ impl HostCache {
     }
 }
 
+/// The snapshot RAM deletes next: the least recently used; at equal use a prompt snapshot before a
+/// turn snapshot. (A conversation's prompt snapshot is stored just before its turn snapshot, so the
+/// pair goes prompt first; across conversations age decides.)
+fn victim(snaps: impl Iterator<Item = (Kind, u64)>) -> Option<usize> {
+    snaps.enumerate().min_by_key(|&(_, (kind, last))| (last, kind == Kind::Turn)).map(|(i, _)| i)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eviction_is_least_recently_used_first() {
+        // An old conversation's turn snapshot goes before a fresh conversation's prompt snapshot.
+        let snaps = [(Kind::Turn, 3), (Kind::Prompt, 9), (Kind::Turn, 10)];
+        assert_eq!(victim(snaps.into_iter()), Some(0));
+        // At equal use the prompt snapshot goes first.
+        let snaps = [(Kind::Turn, 5), (Kind::Prompt, 5)];
+        assert_eq!(victim(snaps.into_iter()), Some(1));
+        assert_eq!(victim(std::iter::empty()), None);
+    }
 
     #[test]
     fn page_chain_identifies_prefixes() {
