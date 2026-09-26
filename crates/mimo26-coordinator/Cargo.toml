@@ -70,3 +70,7 @@ required-features = ["cuda"]
 [[example]]
 name = "vision_check"
 required-features = ["cuda"]
+
+[[example]]
+name = "sample_check"
+required-features = ["cuda"]

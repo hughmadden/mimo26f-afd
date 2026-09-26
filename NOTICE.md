@@ -8,6 +8,7 @@ This repository is MIT-licensed ([LICENSE](LICENSE)). The components below come 
 - **What was taken:**
   - the expert prepare and route-reduce units in `crates/mimo26-expert/kernels/b1/` (`prepare.cu`, `prepared.cuh`, `route_reduce.cu`);
   - the designs of the wire format (`DS41RTE3` v3), the RDMA transport and the host snapshot cache. Per `docs/REUSE.md`, the code for these was written in this project, not copied.
+  - the v15 target-sampling contract and bounded request queue (`crates/mimo26-coordinator/src/sampling.rs`, `kernels/sample.cu`, `src/api.rs`). These were reimplemented, except for the SplitMix64 draw mix, its sampling domain constant and the parameter ranges, which were transcribed.
 - **Licence text:** `crates/mimo26-expert/kernels/b1/LICENSE.ds41rt`.
 
 ## b12x: Apache License 2.0

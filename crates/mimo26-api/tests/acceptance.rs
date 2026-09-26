@@ -901,3 +901,110 @@ fn remote_images_and_images_without_an_encoder_are_400() {
     assert_eq!(status, 400, "{resp}");
     assert!(resp.contains("image encoder"), "{resp}");
 }
+
+/// Perf reset V3: an engine stub that replies with the sampling parameters it was handed.
+struct ParamsStub;
+
+impl Engine for ParamsStub {
+    fn tokenize(&self, messages: &[ChatMessage], _tools: &[Tool], _thinking: bool) -> usize {
+        messages.iter().map(|m| m.content.len()).sum::<usize>() / 4
+    }
+    fn render_chat(&self, messages: &[ChatMessage], _tools: &[Tool], _thinking: bool) -> String {
+        last_content(messages)
+    }
+    fn generate(
+        &self,
+        _prompt: &str,
+        params: &GenerateParams,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<GenerateOutcome, String> {
+        let text = format!("T={} top_p={} top_k={} min_p={} seed={:?}", params.temperature, params.top_p, params.top_k,
+            params.min_p, params.seed);
+        on_delta(&text);
+        Ok(GenerateOutcome { text, finish_reason: "stop".into(), completion_tokens: 1 })
+    }
+}
+
+fn params_reply(extra: &str) -> (u16, String) {
+    let srv = start_engine(ParamsStub);
+    let body = format!(r#"{{"model":"mimo-v2.6-flash","messages":[{{"role":"user","content":"hi"}}]{extra}}}"#);
+    let (status, resp) = http_post(&format!("{}/v1/chat/completions", srv.base), &body);
+    if status != 200 {
+        return (status, resp);
+    }
+    let v = mimo26_api::json::parse(&resp).unwrap();
+    let msg = v.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()).and_then(|c| c.get("message")).unwrap();
+    (status, msg.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string())
+}
+
+/// Perf reset V3 (DS41RT v15's contract): the sampling parameters reach the engine; without them a
+/// request is greedy with every filter off; top_k 0 and -1 are off; a negative seed is its two's
+/// complement.
+#[test]
+fn sampling_parameters_reach_the_engine() {
+    let (status, reply) = params_reply(r#","temperature":0.7,"top_p":0.9,"top_k":40,"min_p":0.05,"seed":-1"#);
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply, "T=0.7 top_p=0.9 top_k=40 min_p=0.05 seed=Some(18446744073709551615)");
+    assert_eq!(params_reply("").1, "T=0 top_p=1 top_k=0 min_p=0 seed=None");
+    assert_eq!(params_reply(r#","temperature":null,"top_k":-1,"seed":42"#).1, "T=0 top_p=1 top_k=0 min_p=0 seed=Some(42)");
+    assert_eq!(params_reply(r#","temperature":1,"top_k":0"#).1, "T=1 top_p=1 top_k=0 min_p=0 seed=None");
+}
+
+/// Out-of-range or malformed sampling parameters are refused, naming the parameter.
+#[test]
+fn invalid_sampling_parameters_are_400() {
+    for (extra, name) in [
+        (r#","temperature":2.5"#, "temperature"),
+        (r#","temperature":-0.1"#, "temperature"),
+        (r#","temperature":"hot""#, "temperature"),
+        (r#","top_p":0"#, "top_p"),
+        (r#","top_p":1.2"#, "top_p"),
+        (r#","min_p":-0.1"#, "min_p"),
+        (r#","min_p":1.5"#, "min_p"),
+        (r#","top_k":1.5"#, "top_k"),
+        (r#","top_k":-2"#, "top_k"),
+        (r#","seed":1.5"#, "seed"),
+    ] {
+        let (status, resp) = params_reply(extra);
+        assert_eq!(status, 400, "{extra}: {resp}");
+        assert!(resp.contains(name), "{extra}: {resp}");
+    }
+}
+
+/// Perf reset V3: an engine whose queue is full; its `admit` refuses.
+struct BusyStub;
+
+impl Engine for BusyStub {
+    fn tokenize(&self, messages: &[ChatMessage], _tools: &[Tool], _thinking: bool) -> usize {
+        messages.iter().map(|m| m.content.len()).sum::<usize>() / 4
+    }
+    fn render_chat(&self, messages: &[ChatMessage], _tools: &[Tool], _thinking: bool) -> String {
+        last_content(messages)
+    }
+    fn admit(&self) -> Result<Option<mimo26_api::engine::QueuePlace>, String> {
+        Err("request queue is full or its wait budget expired".into())
+    }
+    fn generate(&self, _: &str, _: &GenerateParams, _: &mut dyn FnMut(&str)) -> Result<GenerateOutcome, String> {
+        panic!("a refused request must not generate");
+    }
+}
+
+/// A full queue is a 429 with `Retry-After: 1`, streamed or not (the refusal comes before the
+/// response starts), so a client or LiteLLM retries instead of failing the request.
+#[test]
+fn a_full_queue_is_429_with_retry_after() {
+    let srv = start_engine(BusyStub);
+    let hostport = srv.base.trim_start_matches("http://").to_string();
+    for stream in [false, true] {
+        let body = format!(r#"{{"model":"mimo-v2.6-flash","stream":{stream},"messages":[{{"role":"user","content":"hi"}}]}}"#);
+        let mut s = std::net::TcpStream::connect(&hostport).expect("connect");
+        use std::io::Write;
+        write!(s, "POST /v1/chat/completions HTTP/1.1\r\nHost: {hostport}\r\nContent-Type: application/json\r\n\
+            Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 429 Too Many Requests\r\n"), "{resp}");
+        assert!(resp.contains("\r\nRetry-After: 1\r\n"), "{resp}");
+        assert!(resp.contains("rate_limit_exceeded") && resp.contains("queue is full"), "{resp}");
+    }
+}

@@ -23,6 +23,7 @@ use mimo26_attn::ffi::{self as af, CudaError, CudaStream, M26Geom};
 
 use crate::config::{Config, LayerKind};
 use crate::forward::w_name;
+use crate::sampling::{DeviceRow, Sampling};
 use crate::gpu_dense::DenseDevice;
 use crate::wire::WireClient;
 
@@ -64,6 +65,8 @@ unsafe extern "C" {
         s: CudaStream,
     ) -> CudaError;
     fn m26c_f32_to_bf16(x: *const f32, y: *mut u16, n: i64, s: CudaStream) -> CudaError;
+    fn m26c_sample_rows(x: *const f32, ld: i64, vocab: i32, rows: *const core::ffi::c_void, n: i32, out: *mut i32,
+        s: CudaStream) -> CudaError;
     fn m26c_frame_fill(
         idx: *const i32,
         wts: *const f32,
@@ -127,6 +130,34 @@ pub fn device_free_bytes() -> Result<usize, String> {
 
 /// Device memory kept free for allocator slack, cuBLAS and kernel scratch growth.
 pub const KV_MARGIN_BYTES: usize = 512 << 20;
+
+/// The selection kernels over host logit rows (perf reset V3; `examples/sample_check.rs`): each
+/// row's argmax (full width `ld`), overwritten for each of `sampled` by its draw over ids
+/// `[0, vocab)`. Returns the ids and the sampling kernel's wall time in ms.
+pub fn select_rows_host(logits: &[f32], ld: usize, vocab: usize, sampled: &[DeviceRow])
+    -> Result<(Vec<usize>, f64), String> {
+    let rows = logits.len() / ld;
+    let x = DeviceBuffer::alloc(logits.len() * 4).map_err(cuda::error_string)?;
+    x.upload_prefix(bytes_of(logits)).map_err(cuda::error_string)?;
+    let idx = DeviceBuffer::alloc(rows.max(1) * 4).map_err(cuda::error_string)?;
+    let r = DeviceBuffer::alloc(std::mem::size_of_val(sampled).max(32)).map_err(cuda::error_string)?;
+    r.upload_prefix(bytes_of(sampled)).map_err(cuda::error_string)?;
+    unsafe {
+        ck(dflash::m26c_argmax_rows(x.as_ptr() as _, ld as i64, rows as i32, ld as i32, idx.as_ptr() as _, STREAM),
+            "argmax")?;
+        ck(cuda::cudaDeviceSynchronize(), "sync")?;
+    }
+    let t0 = std::time::Instant::now();
+    unsafe {
+        ck(m26c_sample_rows(x.as_ptr() as _, ld as i64, vocab as i32, r.as_ptr() as _, sampled.len() as i32,
+            idx.as_ptr() as _, STREAM), "sample")?;
+        ck(cuda::cudaDeviceSynchronize(), "sync")?;
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    let mut out = vec![0i32; rows];
+    idx.download_prefix(bytes_of_mut(&mut out)).map_err(cuda::error_string)?;
+    Ok((out.into_iter().map(|v| v as usize).collect(), ms))
+}
 
 /// SWA rows a slot keeps between prefills (perf reset L1): the window before the
 /// next query plus room for decode and verify appends. A prefill chunk grows its
@@ -211,6 +242,8 @@ struct Scratch {
     xb: Grow,
     /// DFlash aux features `[rows, 5 * hidden]` (perf reset S1).
     aux: Grow,
+    /// The sampled rows of a selection (perf reset V3, `sampling::DeviceRow`).
+    sample: Grow,
 }
 
 impl Scratch {
@@ -242,6 +275,7 @@ impl Scratch {
             planes: Grow::new()?,
             xb: Grow::new()?,
             aux: Grow::new()?,
+            sample: Grow::new()?,
         })
     }
 
@@ -892,6 +926,9 @@ pub struct DeviceForward {
     spec_policy: SpecPolicy,
     /// `MIMO26_SPEC_TRACE=1`: one line per request per step (drafts' probabilities, matches).
     spec_trace: bool,
+    /// Token ids a sampled request can draw (perf reset V3): the tokenizer's, below the lm_head's
+    /// padded rows. The engine sets it; the config's vocabulary until then.
+    pub sample_vocab: usize,
     /// Page-locked host ranges mapped into the device address space, as
     /// `(host base, bytes, device base)` (perf reset P9: the RDMA rings and body).
     mapped: std::cell::RefCell<Vec<(usize, usize, usize)>>,
@@ -1021,6 +1058,7 @@ impl DeviceForward {
         // One-time P1 prefill config (dynamic shared memory + carveout).
         let (mut reg, mut ctas) = (0i32, 0i32);
         ck(unsafe { af::m26_attn_prefill_tc_config_split(&mut reg, &mut ctas) }, "prefill tc config")?;
+        let sample_vocab = cfg.vocab_size;
         let mut me = Self {
             cfg,
             dense,
@@ -1059,6 +1097,7 @@ impl DeviceForward {
                 },
             },
             spec_trace: std::env::var("MIMO26_SPEC_TRACE").map(|v| v == "1").unwrap_or(false),
+            sample_vocab,
             mapped: std::cell::RefCell::new(Vec::new()),
         };
         let (cfg, mc) = (me.cfg.clone(), me.max_chunk);
@@ -1571,20 +1610,25 @@ impl DeviceForward {
 
     /// One speculative step (perf reset S1, DFlash): draft 7 tokens per request,
     /// verify `[last, d1..d_k]` through the target (`ks[i]` = drafts verified for
-    /// request i, at most 7), accept the longest prefix the target's argmax
+    /// request i, at most 7), accept the longest prefix the target's selection
     /// agrees with, roll the rejected rows out of the KV and feed the accepted
     /// rows to the drafter. Returns each request's new tokens: the accepted
     /// drafts then the target's next token (`acc + 1` of them).
+    ///
+    /// The target's selection is its argmax, or for a sampled request (`draws[i]`: its sampling
+    /// and the tokens it has emitted) a draw per verify row at that row's emitted-token position
+    /// (perf reset V3, DS41RT's sample-and-match: exact, the emitted token is always a draw).
     pub fn spec_step(
         &mut self,
         kvs: &mut [&mut DeviceKv],
         lasts: &[usize],
         ks: &[usize],
+        draws: &[Option<(Sampling, u64)>],
         wire: &mut WireClient,
     ) -> Result<Vec<Vec<usize>>, String> {
         let n = kvs.len();
-        if n == 0 || lasts.len() != n || ks.len() != n {
-            return Err(format!("spec_step: {n} caches, {} tokens, {} ks", lasts.len(), ks.len()));
+        if n == 0 || lasts.len() != n || ks.len() != n || draws.len() != n {
+            return Err(format!("spec_step: {n} caches, {} tokens, {} ks, {} draws", lasts.len(), ks.len(), draws.len()));
         }
         let starts: Vec<usize> = kvs.iter().map(|kv| kv.tokens).collect();
         let seqs: Vec<(usize, usize)> = (0..n).map(|i| (lasts[i], starts[i])).collect();
@@ -1601,7 +1645,7 @@ impl DeviceForward {
         let blocks: Vec<Vec<usize>> = (0..n)
             .map(|i| std::iter::once(lasts[i]).chain(drafts[i].0[..ks[i]].iter().copied()).collect())
             .collect();
-        let am = self.verify_batch(&blocks, kvs, wire)?;
+        let am = self.verify_batch(&blocks, kvs, draws, wire)?;
         let mut out = Vec::with_capacity(n);
         let mut rows = Vec::with_capacity(am.len());
         let mut off = 0;
@@ -1635,12 +1679,14 @@ impl DeviceForward {
     /// rows; attention runs per request over its own cache with the split-KV
     /// kernel (causal by position, so a block row sees the rows before it). Over
     /// a pipelined wire one request's block splits across the two lanes, several
-    /// requests split by request. Returns every row's argmax in block order and
-    /// leaves the rows' aux features in `sc.aux` (same order).
+    /// requests split by request. Returns every row's selection (argmax, or a sampled request's
+    /// draw at the row's position, `draws` as [`Self::spec_step`]) in block order and leaves the
+    /// rows' aux features in `sc.aux` (same order).
     fn verify_batch(
         &mut self,
         blocks: &[Vec<usize>],
         kvs: &mut [&mut DeviceKv],
+        draws: &[Option<(Sampling, u64)>],
         wire: &mut WireClient,
     ) -> Result<Vec<usize>, String> {
         let n = blocks.len();
@@ -1736,14 +1782,67 @@ impl DeviceForward {
                 self.lin(self.sc.x.p(), "lm_head.weight", rows[lane], self.sc.lm.p::<f32>().add(base[lane] * vocab))?;
             }
         }
-        unsafe {
-            ck(dflash::m26c_argmax_rows(self.sc.lm.p(), vocab as i64, total as i32, vocab as i32, self.sc.idx.p(), STREAM),
-                "verify argmax")?;
+        let mut sampled = Vec::new();
+        let mut off = 0;
+        for (b, d) in blocks.iter().zip(draws) {
+            if let Some((s, done)) = d {
+                sampled.extend((0..b.len()).map(|j| s.row(off + j, done + j as u64)));
+            }
+            off += b.len();
         }
-        let mut am = vec![0i32; total];
-        self.sc.idx.buf.download_prefix(bytes_of_mut(&mut am)).map_err(cuda::error_string)?;
+        let am = self.select(total, &sampled)?;
         self.stage("lm_head");
+        Ok(am)
+    }
+
+    /// The token after each of the first `rows` logit rows in `sc.lm`: the argmax, or for each of
+    /// `sampled` (perf reset V3) its draw over the first [`Self::sample_vocab`] ids.
+    pub fn select(&mut self, rows: usize, sampled: &[DeviceRow]) -> Result<Vec<usize>, String> {
+        let vocab = self.cfg.vocab_size;
+        if sampled.iter().any(|r| r.row < 0 || r.row as usize >= rows) {
+            return Err(format!("select: a sampled row outside {rows} rows"));
+        }
+        self.sc.idx.ensure(rows * 4)?;
+        unsafe {
+            ck(dflash::m26c_argmax_rows(self.sc.lm.p(), vocab as i64, rows as i32, vocab as i32, self.sc.idx.p(), STREAM),
+                "argmax")?;
+        }
+        if !sampled.is_empty() {
+            self.sc.sample.ensure(std::mem::size_of_val(sampled))?;
+            self.sc.sample.buf.upload_prefix(bytes_of(sampled)).map_err(cuda::error_string)?;
+            unsafe {
+                ck(m26c_sample_rows(self.sc.lm.p(), vocab as i64, self.sample_vocab.min(vocab) as i32, self.sc.sample.p(),
+                    sampled.len() as i32, self.sc.idx.p(), STREAM), "sample")?;
+            }
+        }
+        let mut am = vec![0i32; rows];
+        self.sc.idx.buf.download_prefix(bytes_of_mut(&mut am)).map_err(cuda::error_string)?;
         Ok(am.into_iter().map(|x| x as usize).collect())
+    }
+
+    /// Draw from one host logit row (perf reset V3: a sampled request resuming exactly at a prompt
+    /// snapshot, whose last row the snapshot kept): the row goes to `sc.lm` row 0.
+    pub fn select_host_row(&mut self, logits: &[f32], r: DeviceRow) -> Result<usize, String> {
+        let vocab = self.cfg.vocab_size;
+        if logits.len() != vocab {
+            return Err(format!("select_host_row: {} logits for a {vocab}-token vocabulary", logits.len()));
+        }
+        self.sc.lm.ensure(vocab * 4)?;
+        self.sc.lm.buf.upload_prefix(bytes_of(logits)).map_err(cuda::error_string)?;
+        Ok(self.select(1, &[DeviceRow { row: 0, ..r }])?[0])
+    }
+
+    /// Download logit row `row` of `sc.lm`.
+    fn lm_row(&self, row: usize) -> Result<Vec<f32>, String> {
+        let vocab = self.cfg.vocab_size;
+        let mut out = vec![0f32; vocab];
+        let rc = unsafe {
+            cuda::cudaMemcpy(out.as_mut_ptr() as _, self.sc.lm.p::<f32>().add(row * vocab) as _, vocab * 4, cuda::D2H)
+        };
+        if rc != cuda::SUCCESS {
+            return Err(format!("logit row download: {}", cuda::error_string(rc)));
+        }
+        Ok(out)
     }
 
     /// Prefill several short prompts in one pass (perf reset B1). Request i's rows
@@ -1755,12 +1854,15 @@ impl DeviceForward {
     /// prep, then P2). A request's segment stays whole in one lane, so its rows
     /// append in order; segments are dealt to two lanes by row count. At most
     /// [`BATCH_ROWS`] rows in all: every row's DFlash aux is captured into the
-    /// buffer sized at boot. Returns each request's greedy next token.
-    pub fn prefill_batch(&mut self, segs: &[&[usize]], kvs: &mut [&mut DeviceKv], wire: &mut WireClient)
-        -> Result<Vec<usize>, String> {
+    /// buffer sized at boot. Returns each request's next token (the argmax, or its draw for
+    /// emitted-token 0 when `sampling[i]` is set, perf reset V3) and, where `keep[i]`, its last
+    /// logit row (for the prompt snapshot).
+    pub fn prefill_batch(&mut self, segs: &[&[usize]], kvs: &mut [&mut DeviceKv], sampling: &[Option<Sampling>],
+        keep: &[bool], wire: &mut WireClient) -> Result<Vec<(usize, Option<Vec<f32>>)>, String> {
         let n = segs.len();
         let total: usize = segs.iter().map(|s| s.len()).sum();
-        if n == 0 || n != kvs.len() || segs.iter().any(|s| s.is_empty()) || total > BATCH_ROWS {
+        if n == 0 || n != kvs.len() || sampling.len() != n || keep.len() != n || segs.iter().any(|s| s.is_empty())
+            || total > BATCH_ROWS {
             return Err(format!("prefill_batch: {n} prompts of {total} rows for {} caches", kvs.len()));
         }
         let cfg = self.cfg.clone();
@@ -1863,12 +1965,10 @@ impl DeviceForward {
             ck(m26c_rmsnorm(self.sc.f.p(), self.final_norm.as_ptr() as _, self.sc.x.p(), n as i32, hid as i32, eps,
                 STREAM), "final norm")?;
             self.lin(self.sc.x.p(), "lm_head.weight", n, self.sc.lm.p())?;
-            ck(dflash::m26c_argmax_rows(self.sc.lm.p(), vocab as i64, n as i32, vocab as i32, self.sc.idx.p(), STREAM),
-                "prefill batch argmax")?;
         }
-        let mut am = vec![0i32; n];
-        self.sc.idx.buf.download_prefix(bytes_of_mut(&mut am)).map_err(cuda::error_string)?;
-        Ok(am.into_iter().map(|x| x as usize).collect())
+        let sampled: Vec<DeviceRow> = sampling.iter().enumerate().filter_map(|(i, s)| s.map(|s| s.row(i, 0))).collect();
+        let next = self.select(n, &sampled)?;
+        next.into_iter().enumerate().map(|(i, t)| Ok((t, if keep[i] { Some(self.lm_row(i)?) } else { None }))).collect()
     }
 
     /// [`Self::prefill_batch`]'s attention for one lane: the qkv and o_proj GEMMs

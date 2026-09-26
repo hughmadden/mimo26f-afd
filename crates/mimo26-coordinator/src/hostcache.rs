@@ -28,8 +28,11 @@
 //!   design uses the device page identity;
 //! - the 39 SWA layers' visible rows (the last `window - 1`);
 //! - the DFlash draft rings;
-//! - the next token (greedy, so the first token after an exact restore needs
-//!   no forward).
+//! - what follows ([`After`]): the argmax there when known and, for a prompt
+//!   snapshot, the last logit row (perf reset V3), so the first token after an
+//!   exact restore needs no forward, greedy or sampled. An exact match that
+//!   cannot serve a request gives way to the longest shorter one
+//!   ([`HostCache::lookup_for`]).
 //!
 //! A prompt is restored only from a snapshot whose tokens are a prefix of it (no
 //! replay of an empty SWA window, trap T17); the rest is prefilled. Everything
@@ -44,6 +47,7 @@ use mimo26_attn::cuda;
 use mimo26_attn::device::DeviceBuffer;
 
 use crate::dforward::{DeviceKv, KV_PAGE_ROWS};
+use crate::sampling::After;
 
 /// Shortest snapshot worth caching (the design's `--host-cache-min-tokens`).
 const MIN_TOKENS: usize = 512;
@@ -124,7 +128,7 @@ struct Snapshot {
     state: (usize, usize),
     swa_rows: usize,
     has_draft: bool,
-    next: usize,
+    after: After,
     kind: Kind,
     last_use: u64,
 }
@@ -266,12 +270,12 @@ impl HostCache {
         }
     }
 
-    /// Store a snapshot of `tokens` with `next` as the token after it: GA rows
+    /// Store a snapshot of `tokens` with `after` for the token after it: GA rows
     /// `[0, tokens.len())` from `kv` (which holds at least that many), the
     /// position state from the device copy `state` (`DeviceKv::save_state_dev`,
     /// `swa_rows` SWA rows per layer). Pages already held are shared, not copied.
     /// On exhaustion the capture is dropped (the request is unaffected).
-    pub fn capture(&mut self, kv: &DeviceKv, tokens: &[usize], next: usize, kind: Kind, state: &DeviceBuffer,
+    pub fn capture(&mut self, kv: &DeviceKv, tokens: &[usize], after: &After, kind: Kind, state: &DeviceBuffer,
         swa_rows: usize) -> Result<(), String> {
         let n = tokens.len();
         if n < MIN_TOKENS || kv.tokens() < n {
@@ -280,6 +284,10 @@ impl HostCache {
         self.clock += 1;
         if let Some(s) = self.snaps.iter_mut().find(|s| s.tokens == tokens) {
             s.last_use = self.clock;
+            s.after.greedy = s.after.greedy.or(after.greedy);
+            if s.after.logits.is_none() {
+                s.after.logits = after.logits.clone();
+            }
             return Ok(());
         }
         let t0 = std::time::Instant::now();
@@ -355,7 +363,7 @@ impl HostCache {
             state: slot,
             swa_rows,
             has_draft,
-            next,
+            after: after.clone(),
             kind,
             last_use: self.clock,
         });
@@ -384,9 +392,21 @@ impl HostCache {
         best.map(|i| (i, self.snaps[i].tokens.len()))
     }
 
+    /// [`Self::lookup`] for a request that is `sampled` or not: a snapshot of the whole prompt
+    /// that cannot give it its first token (no kept logits for a sampled request, no argmax for a
+    /// greedy one) gives way to the longest shorter one.
+    pub fn lookup_for(&self, prompt: &[usize], sampled: bool) -> Option<(usize, usize)> {
+        match self.lookup(prompt) {
+            Some((i, n)) if n == prompt.len() && !self.snaps[i].after.serves(sampled) => {
+                self.lookup(&prompt[..prompt.len() - 1])
+            }
+            hit => hit,
+        }
+    }
+
     /// Load snapshot `idx` into the fresh cache `kv`. Returns `(tokens restored,
-    /// the snapshot's next token, its bank)`.
-    pub fn restore(&mut self, idx: usize, kv: &mut DeviceKv) -> Result<(usize, usize, Kind), String> {
+    /// what follows the snapshot, its bank)`.
+    pub fn restore(&mut self, idx: usize, kv: &mut DeviceKv) -> Result<(usize, After, Kind), String> {
         let t0 = std::time::Instant::now();
         self.clock += 1;
         let s = &mut self.snaps[idx];
@@ -408,12 +428,12 @@ impl HostCache {
             kv.import_draft(&buf[self.swa_bytes..])?;
         }
         kv.set_tokens(n);
-        let (next, kind) = (s.next, s.kind);
+        let (after, kind) = (s.after.clone(), s.kind);
         self.stats.restores += 1;
         self.stats.restored_tokens += n as u64;
         eprintln!("[hostcache] restore {n} tokens in {:.1} ms ({} restores, {} tokens total)",
             t0.elapsed().as_secs_f64() * 1e3, self.stats.restores, self.stats.restored_tokens);
-        Ok((n, next, kind))
+        Ok((n, after, kind))
     }
 }
 

@@ -8,7 +8,14 @@ use crate::types::{ChatMessage, Tool};
 #[derive(Debug, Clone)]
 pub struct GenerateParams {
     pub max_tokens: usize,
+    /// 0 (the default) is greedy; a positive temperature samples (DS41RT v15's contract: filters
+    /// left at `top_p` 1, `top_k` 0 and `min_p` 0 are off).
     pub temperature: f64,
+    pub top_p: f64,
+    pub top_k: usize,
+    pub min_p: f64,
+    /// The request's seed; none: the engine draws one.
+    pub seed: Option<u64>,
     pub stop: Vec<String>,
     pub thinking: bool,
     /// Set by the API once the client is gone (a failed write): the engine stops
@@ -17,12 +24,40 @@ pub struct GenerateParams {
     /// The request's images, in prompt order (perf reset V2). Each stands in the rendered prompt
     /// as an [`image_marker`].
     pub images: Vec<std::sync::Arc<ImageInput>>,
+    /// The request's place in the engine's queue ([`Engine::admit`]), taken by the engine when it
+    /// hands the request on.
+    pub place: std::sync::Arc<std::sync::Mutex<Option<QueuePlace>>>,
+}
+
+/// A place in an engine's bounded request queue (perf reset V3, DS41RT v15's admission), held
+/// from before the response starts until the engine takes the request; dropping it gives the
+/// place back.
+pub struct QueuePlace(Option<Box<dyn FnOnce() + Send>>);
+
+impl QueuePlace {
+    pub fn new(release: impl FnOnce() + Send + 'static) -> Self {
+        QueuePlace(Some(Box::new(release)))
+    }
+}
+
+impl Drop for QueuePlace {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            release();
+        }
+    }
+}
+
+impl std::fmt::Debug for QueuePlace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("QueuePlace")
+    }
 }
 
 impl Default for GenerateParams {
     fn default() -> Self {
-        GenerateParams { max_tokens: 65_536, temperature: 1.0, stop: Vec::new(), thinking: false, cancel: None,
-            images: Vec::new() }
+        GenerateParams { max_tokens: 65_536, temperature: 0.0, top_p: 1.0, top_k: 0, min_p: 0.0, seed: None,
+            stop: Vec::new(), thinking: false, cancel: None, images: Vec::new(), place: Default::default() }
     }
 }
 
@@ -82,6 +117,14 @@ pub trait Engine {
     /// parts with a 400.
     fn vision(&self) -> bool {
         false
+    }
+
+    /// A place in the engine's request queue (perf reset V3, DS41RT v15's bounded admission),
+    /// taken before the response starts: waits up to the engine's budget while the queue is full;
+    /// `Err` (the queue and its waiters full, or the wait expired) is answered 429 with
+    /// `Retry-After`. An engine without a queue admits everything.
+    fn admit(&self) -> Result<Option<QueuePlace>, String> {
+        Ok(None)
     }
 
     /// Generate the completion. `on_delta` is called with each incremental text

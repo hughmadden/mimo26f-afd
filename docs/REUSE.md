@@ -19,6 +19,15 @@ No libjpeg-turbo source file is in this repo. The checkpoint's vision modeling c
 |---|---|---|---|---|---|---|
 | JPEG block smoothing (progressive, incompletely refined coefficients); AVX2 islow IDCT wrap | libjpeg-turbo 3.1.0 `jdcoefct.c` (`decompress_smooth_data`), `simd/x86_64/jidctint-avx2.asm`, read-only from `~/.cargo/registry/.../turbojpeg-sys-1.2.0` | libjpeg-turbo 3.1.0 | `crates/mimo26-image/src/jpeg.rs` | reimplementation in Rust; smoothing constants transcribed | `crates/mimo26-image/tests/goldens.rs` (74 JPEG goldens incl. 36 truncated progressive cuts, bit-exact vs Pillow 12.2 / libjpeg-turbo 3.1.4.1) | 2026-09-26 / image subagent + builder |
 
+### Sampling contract rows (perf reset V3, 26 September 2026 AEST)
+
+Reimplemented, not copied: the request contract and the draw function follow DS41RT v15. The SplitMix64 mix, its target-sampling domain constant and the parameter validation ranges are transcribed; the GPU kernel, the fixed-point weights and the threshold search are this repo's own.
+
+| Unit | Upstream path | Upstream SHA | New path | Delta allowed | Tests that pin it | Date / who |
+|---|---|---|---|---|---|---|
+| Target-sampling contract (greedy default, vLLM filter order, `(seed, position)` draws, seed as two's complement) and the SplitMix64 draw mix | `tpurtell/ds41rt` `rust/crates/ds41rt-core/src/target_sampling.rs` (`TargetSamplingParams::random_uniform`, `new`, `is_greedy`); `rust/crates/ds41rt-api/src/native_v41.rs` (`request_target_sampling`); sample-and-match in `rust/crates/ds41rt-daemon/src/v41_native_serve/scheduler.rs` | `b45171414` (v15) | `crates/mimo26-coordinator/src/sampling.rs`, `kernels/sample.cu`; `crates/mimo26-api/src/types.rs` | All 64 bits of the mix scale the kept weight (DS41RT uses 24 as an f32); ties at top-k kept (vLLM); ids past the tokenizer never drawn | `sampling::tests::*`, `examples/sample_check.rs` (kernel vs CPU reference), `tests/acceptance.rs` `sampling_parameters_reach_the_engine` / `invalid_sampling_parameters_are_400`, `harness/l5_sampling.py` | 2026-09-26 / builder |
+| Bounded HTTP admission (depth = concurrency, 25 s wait, 429 + `Retry-After: 1`) | `tpurtell/ds41rt` `rust/crates/ds41rt-api/src/native_v41/admission.rs`; `ds41rt-daemon/src/cli.rs` (`--http-queue-depth`, `--http-queue-wait-ms`) | `b45171414` (v15) | `crates/mimo26-coordinator/src/api.rs` (`Queue`, `admit`), `crates/mimo26-api/src/engine.rs` (`QueuePlace`) | Blocking threads instead of tokio; memory-bound admissions wait instead of failing | `tests/acceptance.rs` `a_full_queue_is_429_with_retry_after`; `harness/l5_sampling.py --burst` | 2026-09-26 / builder |
+
 ### Oracle import rows (P-201, 23 September 2026 AEST)
 
 Upstream `code/` is **git-ignored** in the unpublished port workspace (non-git source) — these

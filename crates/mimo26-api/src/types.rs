@@ -25,6 +25,10 @@ impl ApiError {
     pub fn internal(msg: impl Into<String>) -> Self {
         ApiError { status: 500, message: msg.into(), code: "server_error".into() }
     }
+    /// The engine's queue is full (perf reset V3): 429, sent with `Retry-After: 1`.
+    pub fn too_many_requests(msg: impl Into<String>) -> Self {
+        ApiError { status: 429, message: msg.into(), code: "rate_limit_exceeded".into() }
+    }
     pub fn body(&self) -> Json {
         Json::Object(vec![
             ("error".into(), Json::Object(vec![
@@ -110,7 +114,13 @@ pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<Tool>,
+    /// Sampling (DS41RT v15's contract): no temperature (or 0) is greedy; `top_k` 0 or -1 is off
+    /// (None); a negative seed is its two's complement.
     pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub top_k: Option<usize>,
+    pub min_p: Option<f64>,
+    pub seed: Option<u64>,
     pub max_tokens: Option<u64>,
     pub stop: Vec<String>,
     pub stream: bool,
@@ -282,7 +292,39 @@ impl ChatRequest {
                 )),
             }
         }
-        let temperature = body.get("temperature").and_then(|t| t.as_f64());
+        let number = |name: &str| -> Result<Option<f64>, ApiError> {
+            match body.get(name) {
+                None | Some(Json::Null) => Ok(None),
+                Some(v) => v.as_f64().filter(|x| x.is_finite()).map(Some)
+                    .ok_or_else(|| ApiError::bad_request(format!("{name} must be a finite number"))),
+            }
+        };
+        let temperature = number("temperature")?;
+        if temperature.is_some_and(|t| !(0.0..=2.0).contains(&t)) {
+            return Err(ApiError::bad_request("temperature must be between 0 and 2"));
+        }
+        let top_p = number("top_p")?;
+        if top_p.is_some_and(|p| !(p > 0.0 && p <= 1.0)) {
+            return Err(ApiError::bad_request("top_p must be greater than 0 and at most 1"));
+        }
+        let min_p = number("min_p")?;
+        if min_p.is_some_and(|p| !(0.0..=1.0).contains(&p)) {
+            return Err(ApiError::bad_request("min_p must be between 0 and 1"));
+        }
+        let top_k = match number("top_k")? {
+            None => None,
+            Some(k) if k.fract() != 0.0 || k < -1.0 => {
+                return Err(ApiError::bad_request("top_k must be -1, 0 or a positive integer"));
+            }
+            Some(k) if k <= 0.0 => None,
+            Some(k) => Some(k as usize),
+        };
+        let seed = match number("seed")? {
+            None => None,
+            Some(x) if x.fract() != 0.0 => return Err(ApiError::bad_request("seed must be an integer")),
+            Some(x) if x < 0.0 => Some(x as i64 as u64),
+            Some(x) => Some(x as u64),
+        };
         let max_tokens = body.get("max_tokens").and_then(|t| t.as_f64()).map(|n| n as u64);
         let stop = match body.get("stop") {
             Some(Json::Str(s)) => vec![s.clone()],
@@ -301,6 +343,10 @@ impl ChatRequest {
             messages,
             tools,
             temperature,
+            top_p,
+            top_k,
+            min_p,
+            seed,
             max_tokens,
             stop,
             stream,

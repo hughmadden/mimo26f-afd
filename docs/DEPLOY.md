@@ -86,6 +86,8 @@ It is serving when the log shows `[wire] rank r …: fabric <dev> port <p> at <N
 | `MIMO26_HOST_CACHE_GB` | auto: min(32, 40% MemAvailable) | KV RAM tier (§5); 0 = off |
 | `MIMO26_PREFIX_CACHE_ENTRIES` | 24 | Snapshots kept on the GPU per bank (prompt, turn) before the oldest goes to RAM (§5) |
 | `MIMO26_VISION` | on | The image encoder (§5a); `0` = off, and image parts are refused with 400 |
+| `MIMO26_QUEUE_DEPTH` | `MIMO26_MAX_SLOTS` | Requests waiting for a slot before callers queue behind them (§5b); the reference setup runs 64 |
+| `MIMO26_QUEUE_WAIT_MS` | 25000 | How long a caller beyond the queue waits for a place before a 429 (§5b) |
 | `MIMO26_PREFILL_SEGMENT_MS` | 2000 | Prefill segment target while other requests decode (×4 when nothing waits) (§5) |
 | `MIMO26_DFLASH` | on if `dflash/` exists | 0 disables the drafter |
 | `MIMO26_SPEC` | on with a drafter | 0 = one token per decode step |
@@ -158,6 +160,32 @@ Chat requests may carry images: Chat Completions `image_url` parts (and `input_i
 
 **Accuracy** (`harness/vision_ref.py` + `examples/vision_check.rs`): against the reference module in FP32, the encoder is within relative L2 2e-2, worst-token cosine 0.994. The reference itself in BF16 is at 7e-2 / 0.933.
 
+## 5b. Sampling and the request queue
+
+Both follow DS41RT v15.
+
+**Greedy is the default.** A request without `temperature`, with `temperature` below 1e-5, or with `top_k` 1 takes the argmax, as every request did before V3. The checkpoint's `generation_config` has `do_sample: false`.
+
+**With a temperature, a request samples.**
+- Parameters: `temperature` (0–2), `top_p` (0–1], `top_k` (0 or -1 = off), `min_p` [0–1] and `seed`. Filters left out are off; out-of-range values get a 400.
+- Filters run in vLLM's order: temperature, `min_p`, `top_k`, `top_p`. Ties at a top-k or top-p boundary are kept.
+- Draws come only from the 151,675 ids the tokenizer knows, never from the lm_head's 901 padding rows.
+- Kernel: `kernels/sample.cu`, one CTA per sampled row; about 0.4 ms for a whole C1 or C16 verify step on the 5090. Greedy rows pay nothing.
+
+**Draws depend only on the seed and the token's position.**
+- Batching, speculation, streaming and the caches cannot change which draw a token gets. A seeded request repeats its text as exactly as greedy decoding does (logits can move in their last bits with the batch shape, which matters only at a near-tie).
+- Without a seed the server picks one.
+- Speculation stays exact (DS41RT's sample-and-match): every verify row draws its own token, and a draft is accepted only while it equals that draw.
+
+**Snapshots keep what a sampled repeat needs.**
+- A prompt snapshot keeps its last logit row (0.6 MB, in host RAM, device and RAM tiers). An exact repeat of a sampled prompt draws its first token from it without a forward.
+- A sampled request's turn snapshot does not record a greedy next token. A greedy exact repeat of one resumes from the longest shorter snapshot.
+
+**The queue is bounded.**
+- At most `MIMO26_QUEUE_DEPTH` requests wait for a slot. Up to as many more callers wait for a place, for at most `MIMO26_QUEUE_WAIT_MS`.
+- Any other caller gets `429` with `Retry-After: 1`, before the response starts, so streams are refused cleanly too.
+- A request that does not fit in GPU memory while others run waits for them (first in, first out) instead of being refused. It is refused only when it would not fit even alone.
+
 ## 6. Fabric and host tuning (optional)
 
 The engine does not depend on any of these:
@@ -165,6 +193,7 @@ The engine does not depend on any of these:
 - **Coordinator CPU:** performance governor and C2 idle states off.
 - **Coordinator NIC link width:** the reference coordinator's CX7 trains at PCIe x8. At x16 the four ranks' returns would land about 2× faster, and they are the long-prompt prefill limit at 4K lanes.
 - **LACP hashing:** with two bonded coordinator ports, the flow hash can leave the bond unbalanced, and the balance can change at each boot; check the per-port counters.
+- **Queue depth 64** (`MIMO26_QUEUE_DEPTH=64`): agent fan-outs of 30–100 requests queue instead of getting 429s. The default (the slot count, as DS41RT) turned a 60-request burst into 14–23 × 429.
 
 ## 7. Verification ladder
 
@@ -182,4 +211,6 @@ Run it after any deploy. All steps run against the live endpoint except X1a.
 | Head-of-line | `harness/l5_hol.py --base …/v1 --target 131072` | PASS (a decoding stream's largest gap ≤ 6 s during a 128K prefill) |
 | Top of memory | `harness/l5_top_memory.py --base …/v1 --target 262144`, with `harness/tools/ballast.cu` holding the GPU nearly full (build: `nvcc -arch=sm_120 -cudart static`) | 4/4 PASS; log shows an in-place rewind and a relocation through RAM |
 | Corruption | `harness/fleet/tonyd2wild/stress-corrupt.py --lane A=http://<coord>:8100 --probe both` | 0 bad lines, 0 storms |
+| Images | `harness/l5_vision.py --base …/v1` | 6/6 PASS |
+| Sampling and queue | `harness/l5_sampling.py --base …/v1 --burst 60` | 8/8 PASS (greedy unchanged, seeded repeats, sampled snapshot repeat, 429 with `Retry-After`); run `--burst` only while the server is otherwise idle |
 | Bench of record | `harness/fleet/tonyd2wild/mimobench.py --levels 1,6,16 --prefill 2000,8000,32000,64000` | Compare with §6 of the perf-reset doc |

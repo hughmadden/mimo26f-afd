@@ -71,6 +71,12 @@ impl BpeTokenizer {
     pub fn vocab_len(&self) -> usize {
         self.vocab.len()
     }
+    /// One past the largest token id, added tokens included (151,675 for MiMo).
+    pub fn id_bound(&self) -> usize {
+        let vocab = self.vocab.values().map(|&id| id as usize + 1).max().unwrap_or(0);
+        let added = self.added_tokens.iter().map(|t| t.id as usize + 1).max().unwrap_or(0);
+        vocab.max(added)
+    }
     pub fn merges_len(&self) -> usize {
         self.merges.len()
     }

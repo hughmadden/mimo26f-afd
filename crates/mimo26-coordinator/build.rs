@@ -18,6 +18,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/dflash.cu");
     println!("cargo:rerun-if-changed=kernels/lm8.cu");
     println!("cargo:rerun-if-changed=kernels/vision.cu");
+    println!("cargo:rerun-if-changed=kernels/sample.cu");
     println!("cargo:rerun-if-changed=../mimo26-attn/kernels/include/mimo26_attn_device.cuh");
     for key in ["MIMO26F_CUDA_ARCH", "MIMO26F_NVCC"] {
         println!("cargo:rerun-if-env-changed={key}");
@@ -30,7 +31,7 @@ fn main() {
     let nvcc = env::var("MIMO26F_NVCC").unwrap_or_else(|_| "nvcc".into());
     let arch = env::var("MIMO26F_CUDA_ARCH").unwrap_or_else(|_| "sm_89".into());
     let mut objs = Vec::new();
-    for name in ["glue", "dflash", "lm8", "vision"] {
+    for name in ["glue", "dflash", "lm8", "vision", "sample"] {
         let src = manifest.join(format!("kernels/{name}.cu"));
         let obj = out.join(format!("{name}.o"));
         let status = Command::new(&nvcc)

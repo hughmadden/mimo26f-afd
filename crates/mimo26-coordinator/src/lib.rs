@@ -27,6 +27,7 @@ pub mod paging;
 pub mod phase;
 pub mod router;
 pub mod sampler;
+pub mod sampling;
 pub mod scheduler;
 pub mod stop;
 pub mod streaming;

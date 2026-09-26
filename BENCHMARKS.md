@@ -3,7 +3,8 @@
 These numbers were measured on 26 September 2026, on the reference setup below.
 
 - **Decode and prefill:** three benchmark runs on the v1.1.0 build. Each cell gives the median, with the range in brackets.
-- **Long-context, cache and memory checks:** measured on v1.1.0 and on v1.1.1. v1.1.1 changes only the RAM tier's eviction order; see Prefix reuse. The step-by-step history, with the build behind each row, is in [docs/design/perf-reset-vs-ds41rt.md](docs/design/perf-reset-vs-ds41rt.md) §6.
+- **Long-context, cache and memory checks:** measured on v1.1.0 and on v1.1.1. v1.1.1 changes only the RAM tier's eviction order; see Prefix reuse.
+- **v1.2.0:** adds sampling and a bounded request queue. With greedy decoding its regression battery matches v1.1.0, so these numbers stand; see Sampling. The step-by-step history, with the build behind each row, is in [docs/design/perf-reset-vs-ds41rt.md](docs/design/perf-reset-vs-ds41rt.md) §6.
 
 ## Reference setup
 
@@ -92,6 +93,20 @@ At about 1M tokens, most of a warm turn is spent tokenising the prompt once, abo
 - **Cost:** 30–100 ms per request for the image upload and encode on the 5090. A 640×480 image is 300 tokens.
 - **Checks on the release build:** `harness/l5_vision.py` passed 6 of 6 end to end, and the API contract passed 5 of 5.
 
+## Sampling (v1.2.0)
+
+- **The contract:** DS41RT v15's.
+  - Greedy is the default: no `temperature`, a `temperature` below 10⁻⁵, or `top_k` 1.
+  - Otherwise `temperature`, `min_p`, `top_k` and `top_p` apply in vLLM's order, then an exact categorical draw.
+  - Draws are SplitMix64 of the seed and the emitted token's position. Speculative decoding stays exact: the drafter's tokens are sampled and matched against the target's.
+- **The kernel:**
+  - It draws only the tokenizer's 151,675 ids, never the output layer's padding rows.
+  - Against the CPU reference: 0 mismatches over 20,480 rows, on both an RTX 5090 and an RTX 4090.
+  - Cost: 0.37 ms per verify step at one stream.
+- **Throughput:** sampled prose decodes 3–6% slower than greedy at one stream and 7–14% slower at 16 streams, because the drafter's guesses are accepted less often.
+- **Exact repeats:** prompt snapshots keep their last logit row (0.6 MB), so a sampled exact repeat draws its first token without a forward pass.
+- **Checks:** `harness/l5_sampling.py` passed 8 of 8 on the release build.
+
 ## Memory
 
 - **Maximum context:** 1,048,576 tokens. The coordinator computes it at boot from free GPU memory, capped at 2^20.
@@ -107,6 +122,7 @@ The commands are in [docs/DEPLOY.md](docs/DEPLOY.md) §7.
 - **API contract:** 5 rows.
 - **Concurrency:** 8 simultaneous needles.
 - **Batched prefill:** first tokens match solo runs in 29 of 30 cases. The one difference is a near-tie.
+- **Sampling:** 8 of 8 (v1.2.0).
 - **Prefix reuse and KV pressure.**
 - **Head-of-line.**
 - **Top of memory:** 4 of 4 at 256K under a 9 GiB GPU ballast.

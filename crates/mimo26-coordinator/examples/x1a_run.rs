@@ -200,7 +200,7 @@ fn main() {
             let (mut steps, mut accepted) = (0usize, 0usize);
             while !eos.contains(g.last().unwrap()) && g.len() < max {
                 let k = (max - g.len() - 1).min(7);
-                let out = f.spec_step(&mut [&mut kv], &[*g.last().unwrap()], &[k], &mut wire).expect("spec_step");
+                let out = f.spec_step(&mut [&mut kv], &[*g.last().unwrap()], &[k], &[None], &mut wire).expect("spec_step");
                 steps += 1;
                 accepted += out[0].len() - 1;
                 for &x in &out[0] {
@@ -245,7 +245,7 @@ fn main() {
             let ks: Vec<usize> = live.iter().map(|&i| (cats[i].2 - gens[i].len() - 1).min(7)).collect();
             let mut rows: Vec<&mut DeviceKv> =
                 kvs.iter_mut().enumerate().filter(|(i, _)| live.contains(i)).map(|(_, k)| k).collect();
-            let out = f.spec_step(&mut rows, &lasts, &ks, &mut wire).expect("batch spec_step");
+            let out = f.spec_step(&mut rows, &lasts, &ks, &vec![None; lasts.len()], &mut wire).expect("batch spec_step");
             for (j, &i) in live.iter().enumerate() {
                 for &x in &out[j] {
                     gens[i].push(x);

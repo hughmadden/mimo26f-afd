@@ -27,12 +27,20 @@ pub fn handle<E: Engine + Send + Sync + 'static>(engine: Arc<E>, body: &Json) ->
     let prompt = engine.render_chat(&req.messages, &req.tools, req.enable_thinking);
     let params = GenerateParams {
         max_tokens: req.max_tokens.unwrap_or(65_536) as usize,
-        temperature: req.temperature.unwrap_or(1.0),
+        temperature: req.temperature.unwrap_or(0.0),
+        top_p: req.top_p.unwrap_or(1.0),
+        top_k: req.top_k.unwrap_or(0),
+        min_p: req.min_p.unwrap_or(0.0),
+        seed: req.seed,
         stop: req.stop.clone(),
         thinking: req.enable_thinking,
         cancel: Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))),
         images: req.images.clone(),
+        place: Default::default(),
     };
+    // A place in the engine's queue before the response starts (perf reset V3): a full queue is a
+    // 429 the client can retry, not a stream that fails.
+    *params.place.lock().unwrap_or_else(|p| p.into_inner()) = engine.admit().map_err(ApiError::too_many_requests)?;
 
     let id = format!("chatcmpl-{}", now_nanos());
     let created = now_secs();

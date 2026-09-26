@@ -5,12 +5,13 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
-use mimo26_api::engine::{Engine, GenerateOutcome, GenerateParams, ImageInput, IMAGE_CLOSE, IMAGE_OPEN};
+use mimo26_api::engine::{Engine, GenerateOutcome, GenerateParams, ImageInput, QueuePlace, IMAGE_CLOSE, IMAGE_OPEN};
 use mimo26_api::types::{ChatMessage, Tool, ToolCall};
 
 use crate::config::Config;
 use crate::dforward::{device_free_bytes, DeviceForward, DeviceKv, EmbedOverlay, BATCH_ROWS, DFLASH_DRAFTS, KV_MARGIN_BYTES};
 use crate::hostcache::{HostCache, Kind};
+use crate::sampling::{After, DeviceRow, Sampling};
 use mimo26_attn::device::DeviceBuffer;
 use crate::serving::{Fp8KvCache, ServingModel};
 use crate::streaming::flush_pending;
@@ -89,6 +90,20 @@ pub struct CoordinatorEngine {
     max_context: Option<usize>,
     /// `<|vision_start|>` and `<|vision_end|>` when the image encoder is loaded (perf reset V2).
     vision_tokens: Option<(u32, u32)>,
+    /// The scheduler's bounded queue (device backend).
+    queue: Option<Arc<Queue>>,
+}
+
+/// The bounded request queue (perf reset V3, DS41RT v15's `--http-queue-depth` and
+/// `--http-queue-wait-ms`): at most `depth` jobs sent to the scheduler and not yet taken
+/// (`MIMO26_QUEUE_DEPTH`, default the slot count); at most `depth` more callers wait up to `wait`
+/// (`MIMO26_QUEUE_WAIT_MS`, default 25,000) for a place; any other caller gets a 429.
+struct Queue {
+    queued: Mutex<usize>,
+    freed: std::sync::Condvar,
+    waiters: std::sync::atomic::AtomicUsize,
+    depth: usize,
+    wait: std::time::Duration,
 }
 
 /// One generation for the scheduler: the prompt, the token budget, the channel
@@ -99,6 +114,10 @@ struct Job {
     tx: mpsc::Sender<Result<usize, String>>,
     cancel: Arc<AtomicBool>,
     images: Vec<ImageSpan>,
+    /// None: greedy (perf reset V3).
+    sampling: Option<Sampling>,
+    /// Its place in the bounded queue, given back when the scheduler takes it (perf reset V3).
+    place: Option<QueuePlace>,
 }
 
 /// An image in a prompt (perf reset V2): the prompt's image tokens `[start, start + tokens)`
@@ -197,6 +216,7 @@ struct Active {
     hist: Vec<usize>,
     /// Retained snapshots inside this slot's history.
     points: Vec<Point>,
+    sampling: Option<Sampling>,
 }
 
 /// A request whose prompt is still being prefilled (perf reset Q1): one segment
@@ -207,8 +227,8 @@ struct Prefilling {
     ids: Vec<usize>,
     /// Prompt tokens in the KV so far.
     done: usize,
-    /// The greedy token after `done` (from the last segment's logits).
-    next: Option<usize>,
+    /// What is known about the token after `done` (from the last segment's logits).
+    after: Option<After>,
     points: Vec<Point>,
     max: usize,
     tx: mpsc::Sender<Result<usize, String>>,
@@ -216,6 +236,7 @@ struct Prefilling {
     /// The prompt's images (perf reset V2) and, once a segment needs them, their encoded rows.
     images: Vec<ImageSpan>,
     overlay: Option<EmbedOverlay>,
+    sampling: Option<Sampling>,
 }
 
 /// A retained snapshot on the device (perf reset K3, the design's device banks):
@@ -225,8 +246,8 @@ struct Prefilling {
 /// device-to-device copy, never RAM traffic.
 struct Point {
     len: usize,
-    /// The greedy token after the snapshot (an exact hit needs no forward).
-    next: usize,
+    /// The token after the snapshot (an exact hit that it serves needs no forward).
+    after: After,
     kind: Kind,
     state: DeviceBuffer,
     swa_rows: usize,
@@ -235,10 +256,10 @@ struct Point {
 
 impl Point {
     /// `kv`'s current position as a point; none when the device has no room.
-    fn save(kv: &DeviceKv, next: usize, kind: Kind, now: u64) -> Option<Point> {
+    fn save(kv: &DeviceKv, after: After, kind: Kind, now: u64) -> Option<Point> {
         let state = DeviceBuffer::alloc(kv.state_bytes()).ok()?;
         match kv.save_state_dev(&state) {
-            Ok(swa_rows) => Some(Point { len: kv.tokens(), next, kind, state, swa_rows, last_use: now }),
+            Ok(swa_rows) => Some(Point { len: kv.tokens(), after, kind, state, swa_rows, last_use: now }),
             Err(e) => {
                 eprintln!("[coordinator] snapshot save failed: {e}");
                 None
@@ -351,7 +372,7 @@ impl Pool {
     /// Store point `p` of the slot `kv` (holding `hist`) to RAM, when the RAM tier is on.
     fn store(cache: &mut Option<HostCache>, kv: &DeviceKv, hist: &[usize], p: &Point) {
         if let Some(c) = cache.as_mut() {
-            if let Err(e) = c.capture(kv, &hist[..p.len], p.next, p.kind, &p.state, p.swa_rows) {
+            if let Err(e) = c.capture(kv, &hist[..p.len], &p.after, p.kind, &p.state, p.swa_rows) {
                 eprintln!("[hostcache] store failed: {e}");
             }
         }
@@ -436,23 +457,34 @@ impl Pool {
         best.map(|b| (b.1, b.2))
     }
 
+    /// [`Self::device_hit`] for a request that is `sampled` or not: a point at the prompt's full
+    /// length that cannot give this request its first token (perf reset V3: a sampled request needs
+    /// the kept logits, a greedy one the argmax) gives way to the longest shorter one.
+    fn device_hit_for(&self, ids: &[usize], sampled: bool) -> Option<(usize, usize)> {
+        match self.device_hit(ids) {
+            Some((si, pi)) if self.retained[si].points[pi].len == ids.len()
+                && !self.retained[si].points[pi].after.serves(sampled) => self.device_hit(&ids[..ids.len() - 1]),
+            hit => hit,
+        }
+    }
+
     /// A slot for a new request of `rows` GA rows, resumed at the longest exact
     /// snapshot of `ids` on the device or in RAM (equal lengths: the device).
     /// Returns the slot, the points it carries and where it resumes, `(tokens,
-    /// next token)` (none: cold).
+    /// what follows)` (none: cold). An exact resume always serves the request (`sampled` or not).
     ///
     /// A device hit on a slot's last point continues in that slot. A hit on an
     /// earlier point forks it into a free slot when one is free and fits without
     /// evicting anything (the retained slot stays whole, as the design's
     /// copy-on-write sharing keeps it); otherwise the slot rewinds to the point
     /// and its later points go to RAM.
-    fn admit(&mut self, fwd: &DeviceForward, ids: &[usize], rows: usize)
-        -> Result<(DeviceKv, Vec<Point>, Option<(usize, usize)>), String> {
+    fn admit(&mut self, fwd: &DeviceForward, ids: &[usize], rows: usize, sampled: bool)
+        -> Result<(DeviceKv, Vec<Point>, Option<(usize, After)>), String> {
         let now = self.now();
-        let dev = self.device_hit(ids);
+        let dev = self.device_hit_for(ids, sampled);
         let dev_len = dev.map_or(0, |(si, pi)| self.retained[si].points[pi].len);
         let host_longer = dev_len < ids.len()
-            && self.cache.as_ref().and_then(|c| c.lookup(ids)).is_some_and(|(_, n)| n > dev_len);
+            && self.cache.as_ref().and_then(|c| c.lookup_for(ids, sampled)).is_some_and(|(_, n)| n > dev_len);
         if let (Some((si, pi)), false) = (dev, host_longer) {
             let top = self.retained[si].points.iter().map(|p| p.len).max().unwrap_or(0);
             // Fork: the point's GA rows copied into a free slot that fits as is.
@@ -470,10 +502,10 @@ impl Pool {
                             .is_ok();
                     if forked {
                         r.points[pi].last_use = now;
-                        let next = r.points[pi].next;
+                        let after = r.points[pi].after.clone();
                         eprintln!("[coordinator] device hit: {dev_len} of {} prompt tokens ({:?} snapshot, forked)",
                             ids.len(), r.points[pi].kind);
-                        return Ok((kv, Vec::new(), Some((dev_len, next))));
+                        return Ok((kv, Vec::new(), Some((dev_len, after))));
                     }
                     self.release(kv);
                 }
@@ -482,7 +514,7 @@ impl Pool {
             let mut r = self.retained.swap_remove(si);
             let x = &mut r.points[pi];
             x.last_use = now;
-            let (next, kind) = (x.next, x.kind);
+            let (after, kind) = (x.after.clone(), x.kind);
             let (keep, later): (Vec<Point>, Vec<Point>) = r.points.into_iter().partition(|p| p.len <= dev_len);
             for p in &later {
                 Self::store(&mut self.cache, &r.kv, &r.hist, p);
@@ -498,7 +530,7 @@ impl Pool {
                 Ok(()) => {
                     eprintln!("[coordinator] device hit: {dev_len} of {} prompt tokens ({kind:?} snapshot, in place)",
                         ids.len());
-                    return Ok((kv, keep, Some((dev_len, next))));
+                    return Ok((kv, keep, Some((dev_len, after))));
                 }
                 // Too little memory to grow the slot in place (near the top the old
                 // GA buffers cannot coexist with the grown ones): with the RAM tier
@@ -529,12 +561,12 @@ impl Pool {
             return Err(e);
         }
         if let Some(c) = self.cache.as_mut() {
-            if let Some((i, _)) = c.lookup(ids) {
+            if let Some((i, _)) = c.lookup_for(ids, sampled) {
                 match c.restore(i, &mut kv) {
-                    Ok((n, next, kind)) => {
+                    Ok((n, after, kind)) => {
                         // The rebuilt snapshot joins the device bank (the design's restore).
-                        let points = Point::save(&kv, next, kind, now).into_iter().collect();
-                        return Ok((kv, points, Some((n, next))));
+                        let points = Point::save(&kv, after.clone(), kind, now).into_iter().collect();
+                        return Ok((kv, points, Some((n, after))));
                     }
                     Err(e) => {
                         eprintln!("[hostcache] restore failed, prefilling cold: {e}");
@@ -560,8 +592,10 @@ impl Pool {
             // (the design's radix bank holds one entry per key).
             if let Some((si, pi)) = self.device_hit(&a.hist[..n]).filter(|&(si, pi)| self.retained[si].points[pi].len == n) {
                 self.retained[si].points[pi].last_use = now;
-            } else if let Some(p) = Point::save(&a.kv, a.hist[n], Kind::Turn, now) {
-                a.points.push(p);
+            } else {
+                // A sampled request's last token is a draw, not the argmax there (perf reset V3).
+                let after = After { greedy: a.sampling.is_none().then_some(a.hist[n]), logits: None };
+                a.points.extend(Point::save(&a.kv, after, Kind::Turn, now));
             }
         }
         if a.points.is_empty() {
@@ -576,14 +610,14 @@ impl Pool {
     /// forward): its position is kept as a snapshot, so a retry of the same
     /// prompt resumes there instead of prefilling again.
     fn park(&mut self, p: Prefilling) {
-        let Prefilling { mut kv, mut ids, done, next, mut points, .. } = p;
+        let Prefilling { mut kv, mut ids, done, after, mut points, .. } = p;
         if let Err(e) = kv.shrink_swa() {
             eprintln!("[coordinator] SWA shrink failed: {e}");
         }
-        if let Some(next) = next.filter(|_| kv.tokens() == done && done >= MIN_RETAIN) {
+        if let Some(after) = after.filter(|_| kv.tokens() == done && done >= MIN_RETAIN) {
             if points.iter().all(|x| x.len < done) {
                 let now = self.now();
-                points.extend(Point::save(&kv, next, Kind::Prompt, now));
+                points.extend(Point::save(&kv, after, Kind::Prompt, now));
             }
         }
         if points.is_empty() {
@@ -666,22 +700,22 @@ const SEG_QUANTUM: usize = 8192;
 const SEG_MAX: usize = 65536;
 
 /// A prefilled request starts decoding with its first token `next`; its
-/// prompt-end snapshot joins the device bank (a device copy, no RAM traffic).
+/// prompt-end snapshot (with `p.after`) joins the device bank (a device copy, no RAM traffic).
 fn start(pool: &mut Pool, active: &mut Vec<Active>, p: Prefilling, next: usize, eos: &[usize]) {
-    let Prefilling { mut kv, ids, mut points, max, tx, cancel, .. } = p;
+    let Prefilling { mut kv, ids, mut points, max, tx, cancel, after, sampling, .. } = p;
     // The prefill is done: its SWA working set goes back (outside the forward).
     if let Err(e) = kv.shrink_swa() {
         eprintln!("[coordinator] SWA shrink failed: {e}");
     }
     let plen = ids.len();
-    if plen >= MIN_RETAIN && points.iter().all(|x| x.len != plen) {
+    if let Some(after) = after.filter(|_| plen >= MIN_RETAIN && points.iter().all(|x| x.len != plen)) {
         let now = pool.now();
-        points.extend(Point::save(&kv, next, Kind::Prompt, now));
+        points.extend(Point::save(&kv, after, Kind::Prompt, now));
     }
     let done = eos.contains(&next) || max <= 1;
     let mut hist = ids;
     hist.push(next);
-    let a = Active { kv, last: next, generated: 1, max, tx, cancel, hist, points };
+    let a = Active { kv, last: next, generated: 1, max, tx, cancel, hist, points, sampling };
     if a.tx.send(Ok(next)).is_err() || done {
         pool.retire(a);
     } else {
@@ -718,6 +752,9 @@ fn scheduler(
     let mut active: Vec<Active> = Vec::new();
     let mut prefilling: std::collections::VecDeque<Prefilling> = std::collections::VecDeque::new();
     let mut deferred: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
+    // A job that did not fit while others ran (perf reset V3): it waits for their memory, first in
+    // first out, instead of being refused.
+    let mut stalled: Option<Job> = None;
     // Prefill segment target (perf reset Q1): the longest a running request waits
     // for its next step while prompts prefill.
     let seg_target = std::env::var("MIMO26_PREFILL_SEGMENT_MS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(2000.0)
@@ -743,7 +780,10 @@ fn scheduler(
             // A job deferred behind an identical prefill goes first once that
             // prefill is done (it then resumes from its snapshot).
             let ready = deferred.iter().position(|j: &Job| !prefilling.iter().any(|p| extends(&j.ids, &p.ids)));
-            let job = if let Some(i) = ready {
+            let was_stalled = stalled.is_some();
+            let mut job = if let Some(j) = stalled.take() {
+                j
+            } else if let Some(i) = ready {
                 deferred.remove(i).expect("deferred job")
             } else if active.is_empty() && prefilling.is_empty() {
                 match rx.recv() {
@@ -757,6 +797,8 @@ fn scheduler(
                     Err(mpsc::TryRecvError::Disconnected) => return,
                 }
             };
+            // Out of the queue: its place goes back (perf reset V3).
+            drop(job.place.take());
             if job.cancel.load(Ordering::Relaxed) {
                 continue;
             }
@@ -772,8 +814,17 @@ fn scheduler(
             // slots are evicted to make room), reserved in one allocation; the prompt
             // resumes at its longest exact snapshot (perf reset K3).
             let rows = admit_rows(job.ids.len(), job.max_tokens);
-            let (kv, points, resume) = match pool.admit(&fwd, &job.ids, rows) {
+            let (kv, points, resume) = match pool.admit(&fwd, &job.ids, rows, job.sampling.is_some()) {
                 Ok(x) => x,
+                // Others hold the memory: wait for them (nothing else is admitted meanwhile).
+                Err(e) if !active.is_empty() || !prefilling.is_empty() => {
+                    if !was_stalled {
+                        eprintln!("[coordinator] a {}-token prompt waits for running requests' memory: {e}",
+                            job.ids.len());
+                    }
+                    stalled = Some(job);
+                    break;
+                }
                 Err(e) => {
                     eprintln!("[coordinator] refused a {}-token prompt: {e}", job.ids.len());
                     let _ = job.tx.send(Err(e));
@@ -781,11 +832,23 @@ fn scheduler(
                 }
             };
             match resume {
-                // An exact snapshot: the first token is known, no forward.
-                Some((n, next)) if n == job.ids.len() => {
-                    let p = Prefilling { kv, ids: job.ids, done: n, next: Some(next), points, max: job.max_tokens,
-                        tx: job.tx, cancel: job.cancel, images: Vec::new(), overlay: None };
-                    start(&mut pool, &mut active, p, next, &eos);
+                // An exact snapshot (one that serves this request): the first token without a forward,
+                // the argmax or, for a sampled request, a draw from the kept logits (perf reset V3).
+                Some((n, after)) if n == job.ids.len() => {
+                    let first = match (job.sampling, after.logits.as_ref()) {
+                        (Some(s), Some(l)) => fwd.select_host_row(l, s.row(0, 0)),
+                        _ => after.greedy.ok_or_else(|| "a snapshot without its next token".to_string()),
+                    };
+                    let p = Prefilling { kv, ids: job.ids, done: n, after: Some(after), points, max: job.max_tokens,
+                        tx: job.tx, cancel: job.cancel, images: Vec::new(), overlay: None, sampling: job.sampling };
+                    match first {
+                        Ok(first) => start(&mut pool, &mut active, p, first, &eos),
+                        Err(e) => {
+                            eprintln!("[coordinator] first token from a snapshot failed: {e}");
+                            let _ = p.tx.send(Err(e));
+                            pool.park(p);
+                        }
+                    }
                 }
                 _ => {
                     // The SWA prefill working set now, before any pipelined forward.
@@ -796,8 +859,9 @@ fn scheduler(
                         pool.release(kv);
                         continue;
                     }
-                    prefilling.push_back(Prefilling { kv, done: resume.map_or(0, |r| r.0), next: None, ids: job.ids,
-                        points, max: job.max_tokens, tx: job.tx, cancel: job.cancel, images: job.images, overlay: None });
+                    prefilling.push_back(Prefilling { kv, done: resume.as_ref().map_or(0, |r| r.0), after: None,
+                        ids: job.ids, points, max: job.max_tokens, tx: job.tx, cancel: job.cancel, images: job.images,
+                        overlay: None, sampling: job.sampling });
                 }
             }
             pool.enforce_banks(&mut active);
@@ -827,15 +891,21 @@ fn scheduler(
             if batch.len() >= 2 {
                 let segs: Vec<Vec<usize>> = batch.iter().map(|p| p.ids[p.done..].to_vec()).collect();
                 let seg_refs: Vec<&[usize]> = segs.iter().map(Vec::as_slice).collect();
+                let sampling: Vec<Option<Sampling>> = batch.iter().map(|p| p.sampling).collect();
+                // The last logit row of a prompt that gets a snapshot (perf reset V3).
+                let keep: Vec<bool> = batch.iter().map(|p| p.ids.len() >= MIN_RETAIN).collect();
                 let result = {
                     let mut kvs: Vec<&mut DeviceKv> = batch.iter_mut().map(|p| &mut p.kv).collect();
-                    fwd.prefill_batch(&seg_refs, &mut kvs, &mut wire)
+                    fwd.prefill_batch(&seg_refs, &mut kvs, &sampling, &keep, &mut wire)
                 };
                 match result {
                     Ok(nexts) => {
-                        for (mut p, next) in batch.into_iter().zip(nexts) {
+                        for (mut p, (next, logits)) in batch.into_iter().zip(nexts) {
                             p.done = p.ids.len();
-                            p.next = Some(next);
+                            p.after = Some(match logits {
+                                Some(l) => After::from_logits(&l, true),
+                                None => After { greedy: p.sampling.is_none().then_some(next), logits: None },
+                            });
                             start(&mut pool, &mut active, p, next, &eos);
                         }
                     }
@@ -887,17 +957,31 @@ fn scheduler(
             p.overlay = fwd.overlay.take();
             match result {
                 Ok(l) => {
-                    let next = greedy(&l[l.len() - vocab..]);
                     // The rate at this context length sizes the next segment.
                     if end - p.done >= SEG_QUANTUM {
                         sec_per_token = t0.elapsed().as_secs_f64() / (end - p.done) as f64;
                     }
                     p.done = end;
-                    p.next = Some(next);
+                    let after = After::from_logits(&l[l.len() - vocab..], end >= MIN_RETAIN);
                     if end < p.ids.len() {
+                        p.after = Some(after);
                         prefilling.push_back(p);
                     } else {
-                        start(&mut pool, &mut active, p, next, &eos);
+                        // The first token: the argmax, or a sampled request's draw for emitted-token 0
+                        // from the row the forward left on the device (perf reset V3).
+                        let first = match p.sampling {
+                            None => Ok(after.greedy.expect("the argmax of a logit row")),
+                            Some(s) => fwd.select(1, &[s.row(0, 0)]).map(|v| v[0]),
+                        };
+                        p.after = Some(after);
+                        match first {
+                            Ok(first) => start(&mut pool, &mut active, p, first, &eos),
+                            Err(e) => {
+                                eprintln!("[coordinator] first token of a {}-token prompt failed: {e}", p.ids.len());
+                                let _ = p.tx.send(Err(e));
+                                pool.park(p);
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -935,9 +1019,11 @@ fn scheduler(
             let lasts: Vec<usize> = active.iter().map(|a| a.last).collect();
             // Never draft past the token budget: a step emits at most k + 1.
             let ks: Vec<usize> = active.iter().map(|a| (a.max - a.generated - 1).min(DFLASH_DRAFTS)).collect();
+            let draws: Vec<Option<(Sampling, u64)>> = active.iter().map(|a| a.sampling.map(|s| (s, a.generated as u64)))
+                .collect();
             let result = {
                 let mut kvs: Vec<&mut DeviceKv> = active.iter_mut().map(|a| &mut a.kv).collect();
-                fwd.spec_step(&mut kvs, &lasts, &ks, &mut wire)
+                fwd.spec_step(&mut kvs, &lasts, &ks, &draws, &mut wire)
             };
             match result {
                 Ok(outs) => {
@@ -978,12 +1064,20 @@ fn scheduler(
         let result = {
             let mut kvs: Vec<&mut DeviceKv> = active.iter_mut().map(|a| &mut a.kv).collect();
             fwd.decode_batch(&ids, &mut kvs, &mut wire)
-        };
+        }
+        .and_then(|logits| {
+            // Sampled requests draw on the device from the rows the step left there (perf reset V3).
+            let rows: Vec<DeviceRow> = active.iter().enumerate()
+                .filter_map(|(i, a)| a.sampling.map(|s| s.row(i, a.generated as u64))).collect();
+            if rows.is_empty() {
+                return Ok((0..active.len()).map(|i| greedy(&logits[i * vocab..(i + 1) * vocab])).collect());
+            }
+            fwd.select(active.len(), &rows)
+        });
         match result {
-            Ok(logits) => {
+            Ok(nexts) => {
                 let mut keep = Vec::with_capacity(active.len());
-                for (i, mut a) in active.drain(..).enumerate() {
-                    let next = greedy(&logits[i * vocab..(i + 1) * vocab]);
+                for (mut a, next) in active.drain(..).zip(nexts) {
                     a.last = next;
                     a.generated += 1;
                     a.hist.push(next);
@@ -1016,7 +1110,7 @@ impl CoordinatorEngine {
     ) -> Self {
         let caches = (0..cfg.num_hidden_layers).map(|l| Fp8KvCache::for_layer(&cfg, l)).collect();
         Self { cfg, backend: Backend::Host { model, caches: Mutex::new(caches), wire: Mutex::new(wire) }, tok, max_context: None,
-            vision_tokens: None }
+            vision_tokens: None, queue: None }
     }
 
     /// The device-resident engine (perf reset R1) behind the batching scheduler
@@ -1025,6 +1119,8 @@ impl CoordinatorEngine {
     /// `MIMO26_SLOT_KV_TOKENS` (default 8192) GA rows and growing on demand.
     pub fn new_device(cfg: Config, mut fwd: DeviceForward, kv: DeviceKv, tok: BpeTokenizer, wire: WireClient) -> Self {
         let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        // Perf reset V3: draws only over ids the tokenizer knows (not the lm_head's padded rows).
+        fwd.sample_vocab = tok.id_bound().clamp(1, cfg.vocab_size);
         let slots = env("MIMO26_MAX_SLOTS", 8).clamp(1, 64);
         let slot_kv = env("MIMO26_SLOT_KV_TOKENS", 4096);
         // Perf reset V2: the image encoder, in page-locked RAM until an image comes (`MIMO26_VISION=0`: off).
@@ -1066,7 +1162,14 @@ impl CoordinatorEngine {
             .name("mimo26-scheduler".into())
             .spawn(move || scheduler(fwd, free, wire, rx, vocab, eos, vision))
             .expect("spawn scheduler");
-        Self { cfg, backend: Backend::Device { jobs: Mutex::new(tx) }, tok, max_context, vision_tokens }
+        let queue = Some(Arc::new(Queue {
+            queued: Mutex::new(0),
+            freed: std::sync::Condvar::new(),
+            waiters: std::sync::atomic::AtomicUsize::new(0),
+            depth: env("MIMO26_QUEUE_DEPTH", slots).max(1),
+            wait: std::time::Duration::from_millis(env("MIMO26_QUEUE_WAIT_MS", 25_000) as u64),
+        }));
+        Self { cfg, backend: Backend::Device { jobs: Mutex::new(tx) }, tok, max_context, vision_tokens, queue }
     }
 
     /// Host reference path: reset the request state, then run one forward step;
@@ -1112,6 +1215,39 @@ impl Engine for CoordinatorEngine {
         self.vision_tokens.is_some()
     }
 
+    fn admit(&self) -> Result<Option<QueuePlace>, String> {
+        let Some(q) = self.queue.clone() else { return Ok(None) };
+        let busy = |why: &str| {
+            eprintln!("[coordinator] 429: the queue (depth {}) is full and {why}", q.depth);
+            Err("request queue is full or its wait budget expired".to_string())
+        };
+        let mut n = q.queued.lock().unwrap_or_else(|p| p.into_inner());
+        if *n >= q.depth {
+            if q.waiters.fetch_add(1, Ordering::Relaxed) >= q.depth {
+                q.waiters.fetch_sub(1, Ordering::Relaxed);
+                drop(n);
+                return busy("so are its waiters");
+            }
+            let deadline = std::time::Instant::now() + q.wait;
+            while *n >= q.depth {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    q.waiters.fetch_sub(1, Ordering::Relaxed);
+                    drop(n);
+                    return busy("the wait expired");
+                }
+                n = q.freed.wait_timeout(n, left).unwrap_or_else(|p| p.into_inner()).0;
+            }
+            q.waiters.fetch_sub(1, Ordering::Relaxed);
+        }
+        *n += 1;
+        drop(n);
+        Ok(Some(QueuePlace::new(move || {
+            *q.queued.lock().unwrap_or_else(|p| p.into_inner()) -= 1;
+            q.freed.notify_one();
+        })))
+    }
+
     fn max_context(&self) -> Option<usize> {
         self.max_context
     }
@@ -1145,6 +1281,8 @@ impl Engine for CoordinatorEngine {
     ) -> Result<GenerateOutcome, String> {
         let prompt_ids: Vec<usize> = self.encode_prompt(prompt).iter().map(|&x| x as usize).collect();
         let cancel = params.cancel.clone().unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        let sampling = Sampling::new(params.temperature as f32, params.top_p as f32, params.top_k, params.min_p as f32,
+            params.seed)?;
         let vocab = self.cfg.vocab_size;
         let eos: Vec<usize> = self.cfg.eos_token_ids.iter().map(|&x| x as usize).collect();
 
@@ -1162,7 +1300,8 @@ impl Engine for CoordinatorEngine {
                 jobs.lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .send(Job { ids: prompt_ids.clone(), max_tokens: max, tx, cancel: cancel.clone(),
-                        images: image_spans(&prompt_ids, &params.images)? })
+                        images: image_spans(&prompt_ids, &params.images)?, sampling,
+                        place: params.place.lock().unwrap_or_else(|p| p.into_inner()).take() })
                     .map_err(|_| "scheduler stopped".to_string())?;
                 Source::Sched { rx, _cancel: CancelOnDrop(cancel.clone()) }
             }
@@ -1178,7 +1317,7 @@ impl Engine for CoordinatorEngine {
         // delta every 15 s keeps the client's connection alive, and a client that
         // left (the API sets `cancel` on a failed write) ends the request, which
         // frees its slot and keeps its prefill as a snapshot for a retry.
-        let next_token = |src: &mut Source<'_>, ids: &[usize], fresh: bool, on_delta: &mut dyn FnMut(&str)|
+        let next_token = |src: &mut Source<'_>, ids: &[usize], fresh: bool, pos: u64, on_delta: &mut dyn FnMut(&str)|
             -> Result<usize, String> {
             match src {
                 Source::Sched { rx, .. } => loop {
@@ -1196,11 +1335,14 @@ impl Engine for CoordinatorEngine {
                 Source::Host(st) => {
                     let logits = self.step(st, ids, fresh)?;
                     debug_assert_eq!(logits.len(), vocab);
-                    Ok(greedy(&logits))
+                    let drawn = sampling.and_then(|s| {
+                        crate::sampling::select(&logits, self.tok.id_bound().clamp(1, vocab), &s.row(0, pos))
+                    });
+                    Ok(drawn.unwrap_or_else(|| greedy(&logits)))
                 }
             }
         };
-        let mut next = next_token(&mut src, &prompt_ids, true, on_delta)?;
+        let mut next = next_token(&mut src, &prompt_ids, true, 0, on_delta)?;
         let mut gen_ids: Vec<usize> = vec![next];
 
         // Decode, streaming one delta per sampled token (the API forwards each as
@@ -1231,7 +1373,7 @@ impl Engine for CoordinatorEngine {
             if cancel.load(Ordering::Relaxed) {
                 return Err("client gone".to_string());
             }
-            next = next_token(&mut src, &[next], false, on_delta)?;
+            next = next_token(&mut src, &[next], false, gen_ids.len() as u64, on_delta)?;
             gen_ids.push(next);
         }
 
