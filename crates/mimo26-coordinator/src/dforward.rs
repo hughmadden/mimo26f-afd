@@ -159,6 +159,31 @@ pub fn select_rows_host(logits: &[f32], ld: usize, vocab: usize, sampled: &[Devi
     Ok((out.into_iter().map(|v| v as usize).collect(), ms))
 }
 
+/// The coupled-draft kernel over host logit rows (`examples/sample_check.rs`): for each of `rows`
+/// the pick and its confidence at noise weight `w` over ids `[0, vocab)`.
+pub fn draft_rows_host(logits: &[f32], ld: usize, vocab: usize, rows: &[DeviceRow], w: f32)
+    -> Result<(Vec<usize>, Vec<f32>), String> {
+    let n = logits.len() / ld;
+    let x = DeviceBuffer::alloc(logits.len() * 4).map_err(cuda::error_string)?;
+    x.upload_prefix(bytes_of(logits)).map_err(cuda::error_string)?;
+    let idx = DeviceBuffer::alloc(n.max(1) * 4).map_err(cuda::error_string)?;
+    let pr = DeviceBuffer::alloc(n.max(1) * 4).map_err(cuda::error_string)?;
+    let r = DeviceBuffer::alloc(std::mem::size_of_val(rows).max(32)).map_err(cuda::error_string)?;
+    r.upload_prefix(bytes_of(rows)).map_err(cuda::error_string)?;
+    unsafe {
+        ck(dflash::m26c_argmax_prob_rows(x.as_ptr() as _, ld as i64, n as i32, ld as i32, idx.as_ptr() as _,
+            pr.as_ptr() as _, STREAM), "argmax")?;
+        ck(dflash::m26c_draft_rows(x.as_ptr() as _, ld as i64, vocab as i32, r.as_ptr() as _, rows.len() as i32, w,
+            idx.as_ptr() as _, pr.as_ptr() as _, STREAM), "draft rows")?;
+        ck(cuda::cudaDeviceSynchronize(), "sync")?;
+    }
+    let mut out = vec![0i32; n];
+    let mut p = vec![0f32; n];
+    idx.download_prefix(bytes_of_mut(&mut out)).map_err(cuda::error_string)?;
+    pr.download_prefix(bytes_of_mut(&mut p)).map_err(cuda::error_string)?;
+    Ok((out.into_iter().map(|v| v as usize).collect(), p))
+}
+
 /// SWA rows a slot keeps between prefills (perf reset L1): the window before the
 /// next query plus room for decode and verify appends. A prefill chunk grows its
 /// slot's SWA buffers for the chunk and [`DeviceKv::shrink_swa`] returns them, so
@@ -926,6 +951,9 @@ pub struct DeviceForward {
     spec_policy: SpecPolicy,
     /// `MIMO26_SPEC_TRACE=1`: one line per request per step (drafts' probabilities, matches).
     spec_trace: bool,
+    /// Coupled drafts' noise weight for sampled requests (`MIMO26_DRAFT_NOISE`, default 0.7,
+    /// TensorFold's; 0 keeps argmax drafts).
+    draft_noise: f32,
     /// Token ids a sampled request can draw (perf reset V3): the tokenizer's, below the lm_head's
     /// padded rows. The engine sets it; the config's vocabulary until then.
     pub sample_vocab: usize,
@@ -1097,6 +1125,7 @@ impl DeviceForward {
                 },
             },
             spec_trace: std::env::var("MIMO26_SPEC_TRACE").map(|v| v == "1").unwrap_or(false),
+            draft_noise: std::env::var("MIMO26_DRAFT_NOISE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.7f32).max(0.0),
             sample_vocab,
             mapped: std::cell::RefCell::new(Vec::new()),
         };
@@ -1617,24 +1646,40 @@ impl DeviceForward {
     ///
     /// The target's selection is its argmax, or for a sampled request (`draws[i]`: its sampling
     /// and the tokens it has emitted) a draw per verify row at that row's emitted-token position
-    /// (perf reset V3, DS41RT's sample-and-match: exact, the emitted token is always a draw).
+    /// (perf reset V3, DS41RT's sample-and-match: exact, the emitted token is always a draw). A
+    /// sampled request's drafts are coupled to those draws (`dflash_draft`).
+    ///
+    /// A request with a copy window (`copies[i]` non-empty, `copy.rs`, TensorFold import) verifies
+    /// those tokens (at most `ks[i]`) instead of drafts, and the drafter skips it this round; its
+    /// accepted rows still become the drafter's context.
     pub fn spec_step(
         &mut self,
         kvs: &mut [&mut DeviceKv],
         lasts: &[usize],
         ks: &[usize],
         draws: &[Option<(Sampling, u64)>],
+        copies: &[Vec<usize>],
         wire: &mut WireClient,
     ) -> Result<Vec<Vec<usize>>, String> {
         let n = kvs.len();
-        if n == 0 || lasts.len() != n || ks.len() != n || draws.len() != n {
-            return Err(format!("spec_step: {n} caches, {} tokens, {} ks, {} draws", lasts.len(), ks.len(), draws.len()));
+        if n == 0 || lasts.len() != n || ks.len() != n || draws.len() != n || copies.len() != n {
+            return Err(format!("spec_step: {n} caches, {} tokens, {} ks, {} draws, {} copies", lasts.len(), ks.len(),
+                draws.len(), copies.len()));
         }
         let starts: Vec<usize> = kvs.iter().map(|kv| kv.tokens).collect();
-        let seqs: Vec<(usize, usize)> = (0..n).map(|i| (lasts[i], starts[i])).collect();
-        let drafts = self.dflash_draft(kvs, &seqs)?;
+        let need: Vec<usize> = (0..n).filter(|&i| copies[i].is_empty()).collect();
+        let mut drafts = vec![([0usize; DFLASH_DRAFTS], [0f32; DFLASH_DRAFTS]); n];
+        if !need.is_empty() {
+            let seqs: Vec<(usize, usize)> = need.iter().map(|&i| (lasts[i], starts[i])).collect();
+            let noise: Vec<Option<(Sampling, u64)>> = need.iter().map(|&i| draws[i]).collect();
+            let sub: Vec<&mut DeviceKv> =
+                kvs.iter_mut().enumerate().filter(|(i, _)| copies[*i].is_empty()).map(|(_, kv)| &mut **kv).collect();
+            for (&i, d) in need.iter().zip(self.dflash_draft(&sub, &seqs, &noise)?) {
+                drafts[i] = d;
+            }
+        }
         self.stage("draft");
-        let ks: Vec<usize> = match self.spec_policy {
+        let policy: Vec<usize> = match self.spec_policy {
             SpecPolicy::Fixed => ks.iter().map(|&k| k.min(DFLASH_DRAFTS)).collect(),
             SpecPolicy::Confidence { a_ms, b_ms } => {
                 let probs: Vec<[f32; DFLASH_DRAFTS]> = drafts.iter().map(|d| d.1).collect();
@@ -1643,7 +1688,10 @@ impl DeviceForward {
             SpecPolicy::Chain { tau } => drafts.iter().zip(ks).map(|(d, &k)| chain_length(&d.1, k, tau)).collect(),
         };
         let blocks: Vec<Vec<usize>> = (0..n)
-            .map(|i| std::iter::once(lasts[i]).chain(drafts[i].0[..ks[i]].iter().copied()).collect())
+            .map(|i| {
+                let d = if copies[i].is_empty() { &drafts[i].0[..policy[i]] } else { &copies[i][..copies[i].len().min(ks[i])] };
+                std::iter::once(lasts[i]).chain(d.iter().copied()).collect()
+            })
             .collect();
         let am = self.verify_batch(&blocks, kvs, draws, wire)?;
         let mut out = Vec::with_capacity(n);
@@ -1657,8 +1705,9 @@ impl DeviceForward {
             }
             if self.spec_trace {
                 let q: Vec<String> = drafts[i].1.iter().map(|p| format!("{p:.3}")).collect();
-                eprintln!("SPEC req={i} k={} acc={acc} p=[{}] match=[{}]", b.len() - 1, q.join(","),
-                    (0..DFLASH_DRAFTS).map(|j| if j < b.len() - 1 { if drafts[i].0[j] == g[j] { '1' } else { '0' } } else { '.' })
+                eprintln!("SPEC req={i} copy={} sampled={} k={} acc={acc} p=[{}] match=[{}]", u8::from(!copies[i].is_empty()),
+                    u8::from(draws[i].is_some()), b.len() - 1, q.join(","),
+                    (0..DFLASH_DRAFTS).map(|j| if j < b.len() - 1 { if b[j + 1] == g[j] { '1' } else { '0' } } else { '.' })
                         .collect::<String>());
             }
             kvs[i].truncate(starts[i] + acc + 1)?;

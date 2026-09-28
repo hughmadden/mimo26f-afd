@@ -4,7 +4,8 @@ These numbers were measured on 26 September 2026, on the reference setup below.
 
 - **Decode and prefill:** three benchmark runs on the v1.1.0 build. Each cell gives the median, with the range in brackets.
 - **Long-context, cache and memory checks:** measured on v1.1.0 and on v1.1.1. v1.1.1 changes only the RAM tier's eviction order; see Prefix reuse.
-- **v1.2.0:** adds sampling and a bounded request queue. With greedy decoding its regression battery matches v1.1.0, so these numbers stand; see Sampling. The step-by-step history, with the build behind each row, is in [docs/design/perf-reset-vs-ds41rt.md](docs/design/perf-reset-vs-ds41rt.md) §6.
+- **v1.2.0:** adds sampling and a bounded request queue. With greedy decoding its regression battery matches v1.1.0, so these numbers stand; see Sampling.
+- **v1.3.0:** adds copy windows and coupled drafts, measured on 28 September 2026. Fresh text decodes as before, so the decode and prefill tables stand; see Copy windows and coupled drafts. The step-by-step history, with the build behind each row, is in [docs/design/perf-reset-vs-ds41rt.md](docs/design/perf-reset-vs-ds41rt.md) §6.
 
 ## Reference setup
 
@@ -106,6 +107,40 @@ At about 1M tokens, most of a warm turn is spent tokenising the prompt once, abo
 - **Throughput:** sampled prose decodes 3–6% slower than greedy at one stream and 7–14% slower at 16 streams, because the drafter's guesses are accepted less often.
 - **Exact repeats:** prompt snapshots keep their last logit row (0.6 MB), so a sampled exact repeat draws its first token without a forward pass.
 - **Checks:** `harness/l5_sampling.py` passed 8 of 8 on the release build.
+
+## Copy windows and coupled drafts (v1.3.0)
+
+Ideas from [TensorFold](https://github.com/ashhart/TensorFold); see NOTICE.md. The comparison is against v1.2.0 on the same Sparks, with every boot gated on the RDMA bond's balance. The setup was also serving live traffic during these runs, so the wall-clock rows are single samples with ±10% noise. The tokens-per-round rows do not depend on other traffic: the streamed tokens arrive in one burst per round, so the client can count rounds.
+
+**Copy windows (greedy, one stream, median of 3; `harness/copy_bench.py`):**
+
+| Output | v1.2.0 tok/s | v1.3.0 tok/s | Change | Reply |
+|---|---:|---:|---:|---|
+| A 1,800-token file written back with one name changed | 159.3 | 171.7 | +7.8% | identical |
+| A 2,400-token file written back with one name changed | 154.8 | 161.6 | +4.4% | identical |
+| An `edit_file` call that quotes the file (end to end) | 154.3 | 161.1 | +4.4% | identical |
+| One function quoted verbatim | 134.9 | 146.9 | +8.9% | a near-tie flip |
+| Fresh code | 104.0 | 104.0 | 0 | identical |
+| Fresh prose | 66.2 | 66.2 | 0 | identical |
+
+- The drafter already predicts copied text well: rewriting a file commits 7.79 tokens per round out of a possible 8, with or without copies. Most of the gain comes from skipping the drafter's pass.
+- Sampled requests don't copy. In a first build that did copy for them, sampled code at temperature 1 fell by half at one stream: a sampled draw leaves the copied text more often, and a failed copy costs the round its drafts.
+
+**Coupled drafts (sampled; one build, trace on, the same 32 prompts; noise weight 0.7 against argmax drafts):**
+
+| | Argmax drafts | Coupled | Change |
+|---|---:|---:|---:|
+| Drafts accepted per round | 1.57 | 1.72 | +9.6% |
+| Tokens per round | 2.57 | 2.72 | +5.8% |
+| Drafts verified per round | 2.98 | 3.60 | +21% |
+| Decode, one stream (mean of prose and code at T 0.7 and T 1.0) | 76.6 tok/s | 79.7 tok/s | +4% |
+
+- The gain is smaller than TensorFold reports. This drafter is less confident than the target on code, and the draft's confidence (its share of the noisy softmax) lengthens chains, so more rows are verified.
+- At 16 streams the difference is within the noise.
+- **Kernels:** 0 mismatches over 20,480 rows for draws and drafts, on an RTX 5090 and an RTX 4090.
+- **Checks:** the regression battery passes: the API contract, the long-context ladder, needles, concurrency, tool-call stress, vision, and sampling 7 of 8.
+  - The failed sampling row is a queue test. At a queue depth of 64, a 60-request burst is never refused.
+  - The first-token check differed in 3 of 30 burst-versus-solo prompts, against 1 in 30 before. That token is the prefill's argmax, which v1.3.0 doesn't change; which prompts land on a near-tie depends on how the burst is batched.
 
 ## Memory
 

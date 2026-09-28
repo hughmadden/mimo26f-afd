@@ -11,6 +11,7 @@ use mimo26_api::types::{ChatMessage, Tool, ToolCall};
 use crate::config::Config;
 use crate::dforward::{device_free_bytes, DeviceForward, DeviceKv, EmbedOverlay, BATCH_ROWS, DFLASH_DRAFTS, KV_MARGIN_BYTES};
 use crate::hostcache::{HostCache, Kind};
+use crate::copy::CopyIndex;
 use crate::sampling::{After, DeviceRow, Sampling};
 use mimo26_attn::device::DeviceBuffer;
 use crate::serving::{Fp8KvCache, ServingModel};
@@ -217,6 +218,8 @@ struct Active {
     /// Retained snapshots inside this slot's history.
     points: Vec<Point>,
     sampling: Option<Sampling>,
+    /// Copy windows over `hist` (TensorFold import, `copy.rs`).
+    copy: CopyIndex,
 }
 
 /// A request whose prompt is still being prefilled (perf reset Q1): one segment
@@ -715,7 +718,7 @@ fn start(pool: &mut Pool, active: &mut Vec<Active>, p: Prefilling, next: usize, 
     let done = eos.contains(&next) || max <= 1;
     let mut hist = ids;
     hist.push(next);
-    let a = Active { kv, last: next, generated: 1, max, tx, cancel, hist, points, sampling };
+    let a = Active { kv, last: next, generated: 1, max, tx, cancel, hist, points, sampling, copy: CopyIndex::default() };
     if a.tx.send(Ok(next)).is_err() || done {
         pool.retire(a);
     } else {
@@ -761,6 +764,7 @@ fn scheduler(
         / 1000.0;
     let mut sec_per_token = 1.0 / 4000.0;
     let spec = fwd.has_dflash() && std::env::var("MIMO26_SPEC").map(|v| v != "0").unwrap_or(true);
+    let copy_on = std::env::var("MIMO26_COPY").map(|v| v != "0").unwrap_or(true);
     let cache = match free.first().map(HostCache::from_env) {
         Some(Ok(c)) => c,
         Some(Err(e)) => {
@@ -772,7 +776,8 @@ fn scheduler(
     let bank = std::env::var("MIMO26_PREFIX_CACHE_ENTRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
     let mut pool = Pool { free, retained: Vec::new(), cache, clock: 0, bank };
     eprintln!("[coordinator] decode: {}; device snapshot banks {bank} prompt + {bank} turn",
-        if spec { "DFlash speculative (block 8)" } else { "one token per step" });
+        if !spec { "one token per step" } else if copy_on { "DFlash speculative (block 8), copy windows" }
+        else { "DFlash speculative (block 8)" });
     loop {
         // Admit: block while idle, otherwise take what is queued while slots last
         // (a retained slot counts as available: admission evicts it if needed).
@@ -1021,9 +1026,15 @@ fn scheduler(
             let ks: Vec<usize> = active.iter().map(|a| (a.max - a.generated - 1).min(DFLASH_DRAFTS)).collect();
             let draws: Vec<Option<(Sampling, u64)>> = active.iter().map(|a| a.sampling.map(|s| (s, a.generated as u64)))
                 .collect();
+            // Copy windows serve greedy requests: a sampled request's draw leaves the copied text
+            // more often, a copy that fails costs the drafter's round, and its coupled drafts
+            // already follow a copied span wherever the target is near-certain.
+            let copies: Vec<Vec<usize>> = active.iter_mut().zip(&ks)
+                .map(|(a, &k)| if copy_on && a.sampling.is_none() { a.copy.propose(&a.hist, k) } else { Vec::new() })
+                .collect();
             let result = {
                 let mut kvs: Vec<&mut DeviceKv> = active.iter_mut().map(|a| &mut a.kv).collect();
-                fwd.spec_step(&mut kvs, &lasts, &ks, &draws, &mut wire)
+                fwd.spec_step(&mut kvs, &lasts, &ks, &draws, &copies, &mut wire)
             };
             match result {
                 Ok(outs) => {

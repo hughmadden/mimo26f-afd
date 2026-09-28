@@ -25,6 +25,15 @@ This repository is MIT-licensed ([LICENSE](LICENSE)). The components below come 
 - **What was taken:** the bench and probe tools in `harness/fleet/tonyd2wild/`, byte-for-byte: `mimobench.py`, `mimo_needle.py`, `replay_exact.py`, `stress-corrupt.py` and `toolcap-proxy.cjs`.
 - **Licence text:** `harness/fleet/tonyd2wild/LICENSE`.
 
+## TensorFold: MIT
+
+- **Source:** <https://github.com/ashhart/TensorFold> at `a83ed1e` (0.3.2).
+- **What was taken:** two drafting ideas, reimplemented; no TensorFold code is included.
+  - **Copy windows:** `crates/mimo26-coordinator/src/copy.rs`. The rule's constants are transcribed: an 8-token entry, at most 7 copied tokens, and the longest match (up to 64 tokens) wins.
+  - **Keyed Gumbel-max sampling and coupled drafts:** `kernels/sample.cu`, `src/sampling.rs`. The noise layout (SplitMix64 over the position key and the token id, then `-ln(-ln u)`) and the draft noise weight of 0.7 are transcribed.
+  - The uniform here has 23 bits, not TensorFold's 24. At 24 bits, `(k + 0.5) · 2^-24` rounds its top value to 1.0 in f32.
+  - `docs/REUSE.md` records the files each idea came from.
+
 ## rdma-core headers: GPL-2.0 or OpenIB.org BSD
 
 - **Source:** the verbs headers in `crates/mimo26-rdma/native/include/` come from linux-rdma/rdma-core.

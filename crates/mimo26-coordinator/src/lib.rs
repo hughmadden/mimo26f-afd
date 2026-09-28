@@ -14,6 +14,7 @@
 
 pub mod chat;
 pub mod config;
+pub mod copy;
 pub mod embeddings;
 pub mod forward;
 pub mod json;

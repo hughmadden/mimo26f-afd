@@ -99,6 +99,7 @@ It is serving when the log shows `[wire] rank r …: fabric <dev> port <p> at <N
 
 Leave these unset in production:
 - `MIMO26_B1_Y=bf16`: BF16 route outputs on the Sparks. A numerical-mode change, awaiting a decision; `runs/20260925-reset/p8`.
+- `MIMO26_COPY=0`: copy windows off (§5c). `MIMO26_DRAFT_NOISE=<w>`: coupled drafts' noise weight (default 0.7; 0 = argmax drafts for sampled requests, §5b).
 - `MIMO26_DRAFT_LM8=0`: back to the BF16 `lm_head` for the drafter. The default is an INT8 copy (+0.59 GiB of GPU memory) for draft passes of up to 8 rows; it gains C1 +0.7% (`runs/20260925-reset/kn4`). Target outputs are unchanged, since the target verifies every draft with its own BF16 `lm_head`.
 - `MIMO26_B1_FC1_GROUPS=8`, `MIMO26_B1_FC2=m64`, `MIMO26_B1_FC1=m16` or `m64` (`m64`: `fc1_m64` below 256 rows too), `MIMO26_B1_FC1_STAGES`, `MIMO26_B1_CHECKED=1`.
 - `MIMO26_ATTN_PREFILL=p1`, `MIMO26_ATTN_PREP=split`, `MIMO26_DECODE_LANES=1`, `MIMO26_DENSE=fp32`, `MIMO26_HOST_FORWARD`.
@@ -176,6 +177,8 @@ Both follow DS41RT v15.
 - Batching, speculation, streaming and the caches cannot change which draw a token gets. A seeded request repeats its text as exactly as greedy decoding does (logits can move in their last bits with the batch shape, which matters only at a near-tie).
 - Without a seed the server picks one.
 - Speculation stays exact (DS41RT's sample-and-match): every verify row draws its own token, and a draft is accepted only while it equals that draw.
+- The draw is a Gumbel-max: the kept token with the largest `logit / T + g`, with `g` Gumbel noise keyed by the position and the token id (TensorFold's keyed sampling). Since v1.3.0; v1.2.0 drew by inverse CDF, so a given seed now gives different text (the same distribution).
+- **Coupled drafts:** a sampled request's DFlash drafts take the target's own noise at their positions, weighted 0.7 (`MIMO26_DRAFT_NOISE`; 0 = argmax drafts). A draft then lands on the draw wherever the drafter and the target agree, instead of being accepted with the probability of the drafter's argmax.
 
 **Snapshots keep what a sampled repeat needs.**
 - A prompt snapshot keeps its last logit row (0.6 MB, in host RAM, device and RAM tiers). An exact repeat of a sampled prompt draws its first token from it without a forward.
@@ -185,6 +188,10 @@ Both follow DS41RT v15.
 - At most `MIMO26_QUEUE_DEPTH` requests wait for a slot. Up to as many more callers wait for a place, for at most `MIMO26_QUEUE_WAIT_MS`.
 - Any other caller gets `429` with `Retry-After: 1`, before the response starts, so streams are refused cleanly too.
 - A request that does not fit in GPU memory while others run waits for them (first in, first out) instead of being refused. It is refused only when it would not fit even alone.
+
+## 5c. Copy windows
+
+For a greedy request, when the last 8 tokens of its context (prompt, then its output) occurred earlier in it, the round verifies the tokens that followed that occurrence (up to 7) instead of DFlash's drafts, and the drafter skips that request for the round. Sampled requests keep DFlash's coupled drafts: their draws leave copied text more often, and a failed copy costs the drafter's round. Rewritten files, edit calls that quote the lines they replace and verbatim quotes decode faster; text with nothing to copy is unchanged. The target verifies copied tokens exactly as drafts, so outputs do not change. `MIMO26_COPY=0` turns it off. Idea and constants from TensorFold (`src/copy.rs`, `docs/REUSE.md`).
 
 ## 6. Fabric and host tuning (optional)
 

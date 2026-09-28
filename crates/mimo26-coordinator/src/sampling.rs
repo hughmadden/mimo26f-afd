@@ -4,13 +4,22 @@
 //!   `top_k == 1`, takes the argmax exactly as before (the checkpoint's `generation_config` has
 //!   `do_sample: false`). Once a request samples, filters it leaves out are off (`top_p = 1`, no
 //!   `top_k`, `min_p = 0`), never inherited.
-//! - **Filters in vLLM's order:** temperature, `min_p`, `top_k`, `top_p`, then an exact
-//!   categorical draw (`kernels/sample.cu`). Ties at a top-k or top-p boundary are kept (vLLM;
+//! - **Filters in vLLM's order:** temperature, `min_p`, `top_k`, `top_p`, then an exact draw from
+//!   what is left (`kernels/sample.cu`). Ties at a top-k or top-p boundary are kept (vLLM;
 //!   DS41RT keeps exactly `k`, lowest id first).
 //! - **Draws are a function of `(seed, position)`**, `position` being the index of the emitted
-//!   token (0 for the first token after the prompt). DS41RT's SplitMix64 with its target-sampling
-//!   domain; the full 64-bit value scales the kept weight. So batching, speculation and the cache
-//!   state cannot change a token, and a request without `seed` gets a random one.
+//!   token (0 for the first token after the prompt). The draw is a Gumbel-max: the kept token with
+//!   the largest `logit / T + g`, `g` Gumbel noise keyed by the position (DS41RT's SplitMix64 with
+//!   its target-sampling domain) and the token id. That is TensorFold's keyed sampling
+//!   (`ashhart/TensorFold`, MIT) and an exact draw from the kept tokens' softmax. So batching,
+//!   speculation and the cache state cannot change a token, and a request without `seed` gets a
+//!   random one. (v1.2.0 drew by inverse CDF from one uniform per position: the same distribution,
+//!   different text for a given seed.)
+//! - **Coupled drafts** (TensorFold import): a sampled request's DFlash drafts are the Gumbel-max of
+//!   the drafter's scores with the target's own noise at the draft's position, weighted
+//!   `MIMO26_DRAFT_NOISE` (0.7, TensorFold's weight; 0 keeps argmax drafts). A draft then lands on
+//!   the target's draw wherever the two distributions agree, instead of being accepted with the
+//!   probability of the drafter's argmax.
 //! - **Speculation stays exact** (DS41RT's sample-and-match): every verify row draws its own
 //!   target token, a draft is accepted while it equals the draw, and the first mismatch emits the
 //!   draw. With single-token drafts that is speculative sampling's accept-with-probability-p(d),
@@ -100,7 +109,8 @@ fn random_seed() -> u64 {
     now ^ NEXT.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed)
 }
 
-/// One sampled row for `m26c_sample_rows` (`kernels/sample.cu` `Row`, 32 bytes).
+/// One sampled row for `m26c_sample_rows` and `m26c_draft_rows` (`kernels/sample.cu` `Row`, 32 bytes).
+/// `rnd` keys the row's noise: [`Sampling::draw`] of its emitted-token position.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DeviceRow {
@@ -149,6 +159,26 @@ fn weight(s: f32, m: f32) -> u64 {
     ((s - m).exp() * Q_SCALE) as u64
 }
 
+/// SplitMix64's finalizer.
+fn mix(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+/// The Gumbel noise of token `id` at the position keyed `rnd` (the kernel's `gumbel`): `-ln(-ln u)`.
+pub fn gumbel(rnd: u64, id: usize) -> f32 {
+    -(-uniform(mix(rnd ^ id as u64)).ln()).ln()
+}
+
+/// A 23-bit uniform in `[2^-24, 1 - 2^-24]` from the top bits of `x`, both ends exact in f32. A
+/// 24-bit `(k + 0.5) * 2^-24` rounds its top value to 1.0, which makes `g` infinite.
+fn uniform(x: u64) -> f32 {
+    ((x >> 41) as f32 + 0.5) * (1.0 / 8_388_608.0)
+}
+
 /// The largest key `t` with `sum(w_i : key_i >= t) >= target` (keys and weights of the candidates).
 fn threshold(mut kw: Vec<(u32, u64)>, target: u64) -> u32 {
     kw.sort_unstable_by(|a, b| b.0.cmp(&a.0));
@@ -168,9 +198,17 @@ fn threshold(mut kw: Vec<(u32, u64)>, target: u64) -> u32 {
 }
 
 /// The CPU reference of `m26c_sample_rows` for one row: the drawn id among `logits[..vocab]`, or
-/// `None` for a non-finite row (the kernel then leaves the argmax). Integer arithmetic throughout
-/// after the maximum, as the kernel; only `exp` may differ in its last bit from the GPU's `expf`.
+/// `None` for a non-finite row (the kernel then leaves the argmax). The kept set is integer
+/// arithmetic after the maximum, as the kernel; the draw adds float noise, so the two can differ
+/// where two kept tokens' noisy scores tie to the last bit (`ln` against the GPU's `logf`).
 pub fn select(logits: &[f32], vocab: usize, r: &DeviceRow) -> Option<usize> {
+    pick(logits, vocab, r, 1.0).map(|x| x.0)
+}
+
+/// The CPU reference of `m26c_draft_rows` (and with `w` 1 of `m26c_sample_rows`) for one row: the
+/// kept token with the largest `s_i + w * g_i`, lowest id among ties, and its share of the softmax
+/// of those scores over the kept set.
+pub fn pick(logits: &[f32], vocab: usize, r: &DeviceRow, w: f32) -> Option<(usize, f32)> {
     let l = &logits[..vocab];
     let s: Vec<f32> = l.iter().map(|&x| x * r.inv_t).collect();
     let m = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -194,18 +232,13 @@ pub fn select(logits: &[f32], vocab: usize, r: &DeviceRow) -> Option<usize> {
         let target = ((r.top_p as f64 * q as f64).ceil() as u64).clamp(1, q);
         kp = threshold(kw, target);
     }
-    let z: u64 = (0..vocab).filter(|&i| keys[i] >= kp).map(|i| weight(s[i], m)).sum();
-    let draw = ((u128::from(r.rnd) * u128::from(z)) >> 64) as u64;
-    let mut acc = 0u64;
-    for i in 0..vocab {
-        if keys[i] >= kp {
-            acc += weight(s[i], m);
-            if draw < acc {
-                return Some(i);
-            }
-        }
-    }
-    None
+    let kept: Vec<(usize, f32)> = (0..vocab).filter(|&i| keys[i] >= kp).map(|i| (i, s[i] + w * gumbel(r.rnd, i))).collect();
+    let &(best, top) = kept.iter().fold(None, |b: Option<&(usize, f32)>, x| match b {
+        Some(b) if b.1 >= x.1 => Some(b),
+        _ => Some(x),
+    })?;
+    let z: f64 = kept.iter().map(|&(_, v)| f64::from(v - top).exp()).sum();
+    Some((best, (1.0 / z) as f32))
 }
 
 #[cfg(test)]
@@ -332,6 +365,70 @@ mod tests {
         for pos in 0..2000 {
             let x = DeviceRow { rnd: Sampling { temperature: 1.0, top_p: 1.0, top_k: 0, min_p: 0.3, seed: 3 }.draw(pos), ..r };
             assert!([0, 1, 4].contains(&select(&logits, 5, &x).unwrap()));
+        }
+    }
+
+    #[test]
+    fn coupled_drafts_land_on_the_draw() {
+        // A drafter that agrees with the target: with the full noise weight its pick is the draw at
+        // every position; at TensorFold's 0.7 it still agrees far more often than an independent
+        // draw would (sum of p_i^2), and always inside the kept set.
+        let target = [2.0f32, 1.5, 1.2, 1.0, 0.8, 0.5, 0.0, -1.0];
+        let s = Sampling::new(1.0, 1.0, 0, 0.0, Some(5)).unwrap().unwrap();
+        let (mut same, n) = (0usize, 20_000u64);
+        for pos in 0..n {
+            let r = s.row(0, pos);
+            let draw = select(&target, target.len(), &r).unwrap();
+            assert_eq!(pick(&target, target.len(), &r, 1.0).unwrap().0, draw);
+            same += usize::from(pick(&target, target.len(), &r, 0.7).unwrap().0 == draw);
+        }
+        let p = softmax(&target.iter().map(|&x| f64::from(x)).collect::<Vec<_>>());
+        let independent: f64 = p.iter().map(|x| x * x).sum();
+        let coupled = same as f64 / n as f64;
+        assert!(coupled > 0.8 && coupled > 3.0 * independent, "coupled {coupled} independent {independent}");
+        // top_k 2 keeps the drafter's picks among its two best.
+        let s2 = Sampling::new(1.0, 1.0, 2, 0.0, Some(9)).unwrap().unwrap();
+        for pos in 0..2000 {
+            assert!(pick(&target, target.len(), &s2.row(0, pos), 0.7).unwrap().0 <= 1);
+        }
+    }
+
+    #[test]
+    fn draft_confidence_is_the_picks_share() {
+        // Without noise the share is the softmax probability of the argmax over the kept set.
+        let logits = [3.0f32, 1.0, 0.0, 0.0];
+        let r = row(1.0, 1.0, 0, 0.0, 1, 0);
+        let (j, p) = pick(&logits, 4, &r, 0.0).unwrap();
+        let want = softmax(&logits.iter().map(|&x| f64::from(x)).collect::<Vec<_>>())[0];
+        assert_eq!(j, 0);
+        assert!((f64::from(p) - want).abs() < 1e-6, "{p} vs {want}");
+        // With noise it is at most 1 and at least 1 / (kept tokens).
+        for pos in 0..100 {
+            let (_, p) = pick(&logits, 4, &row(1.0, 1.0, 0, 0.0, 1, pos), 0.7).unwrap();
+            assert!((0.25..=1.0).contains(&p), "{p}");
+        }
+    }
+
+    #[test]
+    fn noise_is_finite_at_the_uniforms_ends() {
+        for x in [0u64, 1 << 41, u64::MAX, u64::MAX - (1 << 41)] {
+            let u = uniform(x);
+            assert!(u > 0.0 && u < 1.0, "{x:#x}: {u}");
+            assert!((-(-u.ln()).ln()).is_finite(), "{x:#x}");
+        }
+        assert_eq!(uniform(u64::MAX), 1.0 - 1.0 / 16_777_216.0);
+        assert_eq!(uniform(0), 1.0 / 16_777_216.0);
+    }
+
+    #[test]
+    fn noise_is_keyed_by_position_and_token() {
+        let s = Sampling::new(1.0, 1.0, 0, 0.0, Some(0x1234)).unwrap().unwrap();
+        let (a, b) = (s.draw(0), s.draw(1));
+        assert_ne!(gumbel(a, 3), gumbel(b, 3));
+        assert_ne!(gumbel(a, 3), gumbel(a, 4));
+        assert_eq!(gumbel(a, 3), gumbel(s.draw(0), 3));
+        for id in 0..1000 {
+            assert!(gumbel(a, id).is_finite());
         }
     }
 

@@ -88,8 +88,10 @@ unsafe extern "C" {
     fn m26c_lm8_quantize(w: *const u16, v: i64, k: i32, q: *mut i8, scale: *mut f32, s: CudaStream) -> CudaError;
     fn m26c_lm8_gemv(x: *const f32, rows: i32, w: *const i8, scale: *const f32, out: *mut f32, ld: i64, v: i32, k: i32,
         s: CudaStream) -> CudaError;
-    fn m26c_argmax_prob_rows(x: *const f32, ld: i64, rows: i32, vocab: i32, out: *mut i32, prob: *mut f32, s: CudaStream)
+    pub(crate) fn m26c_argmax_prob_rows(x: *const f32, ld: i64, rows: i32, vocab: i32, out: *mut i32, prob: *mut f32, s: CudaStream)
         -> CudaError;
+    pub(crate) fn m26c_draft_rows(x: *const f32, ld: i64, vocab: i32, rows: *const core::ffi::c_void, n: i32, w: f32, out: *mut i32,
+        prob: *mut f32, s: CudaStream) -> CudaError;
 }
 
 /// A request's draft KV: per layer, K and V rings of [`RING`] rows of 8 × 128 BF16.
@@ -461,15 +463,20 @@ impl DeviceForward {
 
     /// Draft [`DRAFTS`] tokens for each request: `seqs[i]` is `kvs[i]`'s bonus
     /// token (sampled, not yet in the target cache) and its position. Each draft
-    /// comes with the drafter's softmax probability of it.
+    /// comes with the drafter's softmax probability of it. A sampled request
+    /// (`noise[i]`: its sampling and the emitted-token position of its first draft)
+    /// gets coupled drafts (TensorFold import, `sampling.rs`): each the Gumbel-max
+    /// of the drafter's scores under the request's filters with `draft_noise` times
+    /// the target's noise at that position, with its share of those scores' softmax.
     pub(crate) fn dflash_draft(
         &mut self,
         kvs: &[&mut DeviceKv],
         seqs: &[(usize, usize)],
+        noise: &[Option<(Sampling, u64)>],
     ) -> Result<Vec<([usize; DRAFTS], [f32; DRAFTS])>, String> {
         let nseq = seqs.len();
-        if nseq == 0 || nseq != kvs.len() {
-            return Err(format!("dflash_draft: {nseq} requests for {} caches", kvs.len()));
+        if nseq == 0 || nseq != kvs.len() || noise.len() != nseq {
+            return Err(format!("dflash_draft: {nseq} requests for {} caches, {} noise rows", kvs.len(), noise.len()));
         }
         let rows = nseq * BLOCK;
         self.dflash_ensure(rows, nseq)?;
@@ -539,6 +546,24 @@ impl DeviceForward {
             ck(m26c_argmax_prob_rows(self.sc.lm.p(), vocab as i64, r, vocab as i32, d.am.p(), d.pr.p(), STREAM),
                 "dflash argmax")?;
         }
+        let coupled: Vec<DeviceRow> = if self.draft_noise > 0.0 {
+            noise.iter().enumerate()
+                .filter_map(|(i, x)| x.map(|(s, pos)| (i, s, pos)))
+                .flat_map(|(i, s, pos)| (0..DRAFTS).map(move |j| s.row(i * BLOCK + 1 + j, pos + j as u64)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !coupled.is_empty() {
+            self.sc.sample.ensure(std::mem::size_of_val(&coupled[..]))?;
+            self.sc.sample.buf.upload_prefix(bytes_of(&coupled)).map_err(cuda::error_string)?;
+            let d = self.dflash.as_ref().ok_or("no drafter")?;
+            unsafe {
+                ck(m26c_draft_rows(self.sc.lm.p(), vocab as i64, self.sample_vocab.min(vocab) as i32, self.sc.sample.p(),
+                    coupled.len() as i32, self.draft_noise, d.am.p(), d.pr.p(), STREAM), "dflash coupled drafts")?;
+            }
+        }
+        let d = self.dflash.as_ref().ok_or("no drafter")?;
         let mut am = vec![0i32; rows];
         let mut pr = vec![0f32; rows];
         d.am.buf.download_prefix(bytes_of_mut(&mut am)).map_err(cuda::error_string)?;

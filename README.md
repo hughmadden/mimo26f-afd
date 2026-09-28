@@ -25,10 +25,12 @@ It is written in Rust and handwritten CUDA, with no external Rust crates. It is 
   - **A bounded request queue (v1.2.0).**
     - Up to `MIMO26_QUEUE_DEPTH` requests (default: the slot count) wait up to `MIMO26_QUEUE_WAIT_MS` (25 s). Beyond that, the API answers 429 with `Retry-After: 1` before the response starts.
     - A request that doesn't fit in GPU memory waits for running ones instead of being refused.
-- **Sampling (v1.2.0).**
+- **Sampling (v1.2.0; coupled drafts v1.3.0).**
   - Greedy is the default.
   - `temperature`, `top_p`, `top_k`, `min_p` and `seed` follow DS41RT v15's contract, with filters applied in vLLM's order.
   - Each draw is a function of the seed and the token's position, so batching, caching and speculative decoding leave a seeded request's output unchanged.
+  - Since v1.3.0 a draw is a keyed Gumbel-max, and a sampled request's drafts take the target's own noise at their positions (coupled drafts, an idea from [TensorFold](https://github.com/ashhart/TensorFold)). The distribution is the same as v1.2.0's, but a given seed produces different text.
+- **Copy windows (v1.3.0).** Agent output often repeats its context: a file written back with one name changed, an edit call that quotes the lines it replaces. When a greedy request's last 8 tokens occurred earlier in its context, the round verifies up to 7 tokens copied from what followed, instead of the drafter's. The rule comes from [TensorFold](https://github.com/ashhart/TensorFold). Outputs do not change.
 - **Vision (v1.1.0).**
   - Images arrive as PNG or JPEG in inline data URLs. A dependency-free crate decodes and preprocesses them, matching Pillow bit for bit.
   - The checkpoint's own vision encoder runs on the coordinator. Its weights stay in page-locked host RAM and are uploaded per request, so the KV budget and the 1,048,576-token context are unchanged.
@@ -36,7 +38,7 @@ It is written in Rust and handwritten CUDA, with no external Rust crates. It is 
 
 ## Results
 
-These were measured on the reference setup with tonyd2wild's `mimobench.py` (prompt set v1, temperature 0), vendored in `harness/fleet/tonyd2wild/`. The comparison is the 4-Spark vLLM reference: vLLM TP4 on the same Sparks, without the 5090, using [tonyd2wild's recipe](https://github.com/tonyd2wild/MiMo-V2.6-Flash-DGX-Spark-Recipe) with DFlash k=7. The deltas therefore compare two deployments, and a large part of the uplift is the fifth device. Decode figures are means over the nine prompt categories. Each cell is the median of three runs on the v1.1.0 build. With greedy decoding, v1.2.0's regression battery matches. Sampled prose decodes 3–6% slower than greedy at one stream and 7–14% slower at 16, because the drafter's guesses are accepted less often.
+These were measured on the reference setup with tonyd2wild's `mimobench.py` (prompt set v1, temperature 0), vendored in `harness/fleet/tonyd2wild/`. The comparison is the 4-Spark vLLM reference: vLLM TP4 on the same Sparks, without the 5090, using [tonyd2wild's recipe](https://github.com/tonyd2wild/MiMo-V2.6-Flash-DGX-Spark-Recipe) with DFlash k=7. The deltas therefore compare two deployments, and a large part of the uplift is the fifth device. Decode figures are means over the nine prompt categories. Each cell is the median of three runs on the v1.1.0 build. With greedy decoding, v1.2.0's regression battery matches. Sampled prose decodes 3–6% slower than greedy at one stream and 7–14% slower at 16, because the drafter's guesses are accepted less often. v1.3.0 leaves fresh text unchanged. It speeds up copy-heavy agent output by 4–9% and sampled decoding at one stream by about 4% ([BENCHMARKS.md](BENCHMARKS.md#copy-windows-and-coupled-drafts-v130)).
 
 | | This engine (4 Sparks + 5090) | 4-Spark vLLM reference | Over the reference |
 |---|---:|---:|---:|
@@ -146,6 +148,7 @@ The documents are the project's working record, so read them with three things i
 - **[b12x](https://github.com/local-inference-lab/b12x)** by the b12x authors: the block-scaled MMA primitive and the W4A8 slice schedule behind the B1 kernel (Apache-2.0).
 - **[tonyd2wild's MiMo-V2.6-Flash DGX Spark recipe](https://github.com/tonyd2wild/MiMo-V2.6-Flash-DGX-Spark-Recipe)** by Tech2wild ([@Tech2Wild](https://x.com/Tech2Wild)): the vLLM TP4 reference and the vendored bench and stress tools (MIT).
 - **[@majewskizby](https://x.com/majewskizby)**: the 8-bit drafter-head idea, from the [DeepSeek-V4.1-Flash four-Spark TP4 recipe](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4).
+- **[TensorFold](https://github.com/ashhart/TensorFold)** by ashhart: copy windows and coupled drafts (keyed Gumbel-max sampling, with drafts that take the target's noise), reimplemented from its source and recipes (MIT).
 - **The Xiaomi MiMo team**: the model and its drafters.
 
 ## License

@@ -1,6 +1,7 @@
 //! Served sampling kernel check (perf reset V3): `m26c_sample_rows` against the CPU reference
 //! `sampling::select` on synthetic logit rows at MiMo's width (152,576 lm_head rows, 151,675
-//! sampleable ids), and the kernel's time at serving shapes.
+//! sampleable ids), the coupled-draft kernel `m26c_draft_rows` against `sampling::pick` (noise
+//! weight 0.7), and the kernels' time at serving shapes.
 //!
 //!   sample_check [rows (default 2048)]
 //!
@@ -8,11 +9,12 @@
 //! 0.5), damaged (NaN and -inf entries), one-hot, each with a strong peak in the padding rows that
 //! must never be drawn. Parameters: random temperature / top_p / top_k / min_p per row.
 //!
-//! PASS: every draw equals the reference's and lies below 151,675. The two differ only in `exp`'s
-//! last bit, which can move a draw only when it lands within ~1e-7 of a boundary.
+//! PASS: every draw and draft equals the reference's and lies below 151,675, except where the two
+//! picks' noisy scores tie within 1e-5 (the GPU's `logf` and the host's `ln` can differ in the last
+//! bit); draft confidences agree within 1e-3. Ties are counted and reported.
 
-use mimo26_coordinator::dforward::select_rows_host;
-use mimo26_coordinator::sampling::{select, Sampling};
+use mimo26_coordinator::dforward::{draft_rows_host, select_rows_host};
+use mimo26_coordinator::sampling::{gumbel, pick, select, DeviceRow, Sampling};
 
 const LD: usize = 152_576;
 const VOCAB: usize = 151_675;
@@ -67,7 +69,9 @@ fn logits(rng: &mut Rng, kind: usize) -> Vec<f32> {
 fn main() {
     let n: usize = std::env::args().nth(1).and_then(|v| v.parse().ok()).unwrap_or(2048);
     let mut rng = Rng(0x5eed_1234_abcd_ef01);
-    let (mut rows_done, mut bad, mut kernel_ms, mut chunks) = (0usize, 0usize, 0f64, 0usize);
+    let (mut rows_done, mut bad, mut ties, mut kernel_ms, mut chunks) = (0usize, 0usize, 0usize, 0f64, 0usize);
+    // The noisy score of token `i` in a row (the kernels' `s_i + w * g_i`).
+    let score = |row: &[f32], d: &DeviceRow, w: f32, i: usize| row[i] * d.inv_t + w * gumbel(d.rnd, i);
     while rows_done < n {
         let m = (n - rows_done).min(128);
         let mut x = Vec::with_capacity(m * LD);
@@ -81,21 +85,33 @@ fn main() {
             sampled.push(s.row(r, rng.next() % 4096));
         }
         let (got, ms) = select_rows_host(&x, LD, VOCAB, &sampled).expect("kernel");
+        let (drafts, conf) = draft_rows_host(&x, LD, VOCAB, &sampled, 0.7).expect("draft kernel");
         kernel_ms += ms;
         chunks += 1;
         for (r, d) in sampled.iter().enumerate() {
             let row = &x[r * LD..(r + 1) * LD];
-            let want = select(row, VOCAB, d);
-            let g = got[r];
-            if want != Some(g) || g >= VOCAB {
-                bad += 1;
-                eprintln!("row {}: kind {} T {:.2} top_p {} top_k {} ln_min_p {}: gpu {g} cpu {want:?}", rows_done + r,
-                    r % 5, 1.0 / d.inv_t, d.top_p, d.top_k, d.ln_min_p);
+            for (what, w, g, want) in [("draw", 1.0f32, got[r], select(row, VOCAB, d).map(|j| (j, 0.0))),
+                ("draft", 0.7, drafts[r], pick(row, VOCAB, d, 0.7))] {
+                let ok = match want {
+                    Some((j, _)) if j == g => true,
+                    Some((j, _)) if g < VOCAB && (score(row, d, w, j) - score(row, d, w, g)).abs() <= 1e-5 => {
+                        ties += 1;
+                        true
+                    }
+                    _ => false,
+                };
+                let conf_ok = what == "draw" || want.is_some_and(|(_, p)| (p - conf[r]).abs() <= 1e-3);
+                if !ok || !conf_ok || g >= VOCAB {
+                    bad += 1;
+                    eprintln!("row {}: {what} kind {} T {:.2} top_p {} top_k {} ln_min_p {}: gpu {g} ({}) cpu {want:?}",
+                        rows_done + r, r % 5, 1.0 / d.inv_t, d.top_p, d.top_k, d.ln_min_p, conf[r]);
+                }
             }
         }
         rows_done += m;
     }
-    println!("{n} rows: {bad} mismatches; kernel {:.3} ms per 128-row batch", kernel_ms / chunks as f64);
+    println!("{n} rows (draws and drafts): {bad} mismatches, {ties} last-bit ties; kernel {:.3} ms per 128-row batch",
+        kernel_ms / chunks as f64);
     // Serving shapes: a C1 speculative step (8 rows) and C16 (128 rows), T 0.7 / top_p 0.95.
     for m in [1usize, 8, 128] {
         let mut x = Vec::with_capacity(m * LD);
